@@ -1,9 +1,7 @@
 import torch
 import torch.nn.functional as F
 import cv2
-
 import numpy as np
-import matplotlib.pyplot as plt
 
 class DinoSemanticObjectExtractor:
     def __init__(self, patch_size=14):
@@ -14,6 +12,51 @@ class DinoSemanticObjectExtractor:
         features_norm = F.normalize(features, p=2, dim=1)
         #features_norm = features[:,-64:]
         return features_norm, H_p, W_p
+
+    def build_anchor_to_patch_affinity_recursive(self, centroids, inhibition_mask, max_hops=1):
+        """
+        Args:
+            centroids       : [K] 형태의 1D Tensor (정예 앵커 인덱스)
+            inhibition_mask : [N, N] 형태의 공간-시맨틱 융합 마스크 (바이너리 인접 행렬)
+            max_hops        : 연결선을 타고 들어갈 최대 깊이 (물체 최대 크기에 비례하여 조절)
+        Returns:
+            affinity_matrix : [K, N] 형태의 광역 도달 가능성(Reachability) 어피니티 행렬
+        """
+
+        N = inhibition_mask.shape[0]
+        K = centroids.shape[0]
+        device = inhibition_mask.device
+
+        # 1. 초기 1-hop 어피니티 맵 추출 [K, N] (기존 박사님 코드)
+        # float 형태로 변환해야 행렬 곱 가속을 쓸 수 있습니다.
+        adj_matrix = inhibition_mask.float()
+
+        # current_affinity: [K, N] (각 앵커별 현재 도달한 패치들)
+        current_affinity = adj_matrix[centroids.long(), :]
+
+        # 자기 자신(앵커 본인 위치)은 무조건 포함하도록 초기화
+        identity_k = torch.zeros((K, N), device=device)
+        identity_k[torch.arange(K, device=device), centroids.long()] = 1.0
+        current_affinity = torch.clamp(current_affinity + identity_k, 0.0, 1.0)
+
+        # 2. 💡 [그래프 확산 엔지니어링]: 행렬곱을 이용한 다중 홉(Multi-hop) 이웃 전산 전개
+        # 반복문을 돌지만 내부 연산은 전체 K개 앵커에 대해 완전 병렬(Batch)로 GPU 가속됩니다.
+        for _ in range(max_hops):
+            # [K, N] x [N, N] -> [K, N]
+            # 현재 내 영역에 속한 패치들이 '다음 단계로 갈 수 있는 이웃'들을 한 번에 서치
+            next_affinity = torch.mm(current_affinity, adj_matrix)
+
+            # 기존 영역과 새롭게 도달한 영역의 합집합 연산 (0.0 또는 1.0으로 바이너리화)
+            next_affinity = torch.clamp(next_affinity + current_affinity, 0.0, 1.0)
+
+            # 💡 [조기 종료 조건]: 더 이상 새로 추가되는 패치가 없다면 수렴한 것으로 판단하고 루프 탈출
+            if torch.equal(next_affinity, current_affinity):
+                break
+
+            current_affinity = next_affinity
+
+        # 최종 결과를 다시 Boolean 구조 [K, N] (또는 필요에 따라 float) 형태로 리턴
+        return current_affinity > 0.5
 
     def build_anchor_to_patch_affinity(self, centroids, inhibition_mask):
         """
@@ -26,7 +69,7 @@ class DinoSemanticObjectExtractor:
         """
         return inhibition_mask[centroids.long(), :]
 
-    def build_anchor_to_anchor_link(self, affinity, min_overlap_patches = 1):
+    def build_anchor_to_anchor_link(self, affinity, min_overlap_patches = 2):
         K,N = affinity.shape
         if K == 0:
             return torch.zeros((0,0), device = affinity.device, dtype=torch.bool)
@@ -45,6 +88,13 @@ class DinoSemanticObjectExtractor:
     def generate_mask(self, features, grid_shape, spatial_radius = 2, sim_thresh = 0.7):
         H_p, W_p = grid_shape
         device = features.device
+
+        sim_matrix = torch.mm(features, features.t())
+        semantic_mask = sim_matrix > sim_thresh
+
+        if spatial_radius <= 0:
+            return semantic_mask
+
         grid_y, grid_x = torch.meshgrid(torch.arange(H_p, device=device), torch.arange(W_p, device=device),
                                         indexing='ij')
         coords = torch.stack([grid_y.flatten(), grid_x.flatten()], dim=1).float()
@@ -52,9 +102,6 @@ class DinoSemanticObjectExtractor:
 
         # 💡 반경 이내 이웃 여부를 정의하는 불리언 행렬 [N, N]
         spatial_mask = (dist_matrix < spatial_radius)
-
-        sim_matrix = torch.mm(features, features.t())
-        semantic_mask = sim_matrix > sim_thresh
 
         inhibition_mask = spatial_mask & semantic_mask
         return inhibition_mask
@@ -98,6 +145,38 @@ class DinoSemanticObjectExtractor:
         avg_features = feature_sums / patch_counts
         return F.normalize(avg_features, p=2, dim=-1)
 
+    def extract_sample_neighborhood_pure_average(self, feat_norm, affinity):
+        """
+        Args:
+            feat_norm : [N, D] 이미 L2 정규화가 완료된 오프라인/온라인 패치 피처 행렬 (float32)
+            affinity  : [K, N] 이미 구해진 공간-시맨틱 융합 어피니티 마스크 (0 또는 1)
+
+        Returns:
+            sample_avg_vecs      : [K, D] 노말라이즈 없이 순수하게 연결된 패치 정보의 평균 피처 벡터
+            n_patches_per_sample : [K] 각 사물 앵커가 포섭한 순수 패치 개수 (연결된 애들 수)
+        """
+        device = feat_norm.device
+        K, N = affinity.shape
+
+        if K == 0:
+            return torch.empty((0, feat_norm.shape[1]), device=device), torch.zeros(0, device=device)
+
+        # 1. 어피니티 마스크를 float 텐서로 매핑 [K, N]
+        masks_bool = affinity.float()
+
+        # 2. 💡 [연결 된 애들 수]: 각 샘플 그룹별 포섭된 유효 패치 개수 산출 [K]
+        n_patches_per_sample = masks_bool.sum(dim=1)  # [K]
+
+        # 3. 💡 [패치 정보 더하기]: 마스크 기반 전수 합산 (BLAS 가속 행렬곱 한 방)
+        # [K, N] @ [N, D] -> [K, D]
+        sum_vecs = torch.mm(masks_bool, feat_norm)
+
+        # 4. 💡 [연결 된 애들의 평균]: 합산된 벡터를 연결된 패치 수로 나누어 순수 평균 벡터 도출
+        denom = n_patches_per_sample.unsqueeze(1)  # [K, 1]
+        sample_avg_vecs = torch.where(denom > 0, sum_vecs / denom, torch.zeros_like(sum_vecs))
+
+        # 박사님 지시대로 최종 단의 F.normalize 과정을 원천 삭제하여 순수 물리 값 보존
+        return sample_avg_vecs, n_patches_per_sample
     def extract_sample_neighborhood_average_pool(self, x_cat, affinity):
         """
         [진우 박사님 낭비 제로 최적화]
@@ -140,99 +219,6 @@ class DinoSemanticObjectExtractor:
 
         return sample_avg_vecs_norm, n_patches_per_sample
 
-    def visualize_anchor_relations(self, img_bgr, centroids, inhibition_mask, anchor_links, grid_shape):
-        """
-        [진우 박사님 디버깅용 - OpenCV 행렬 연산 크기 불일치 예외 차단 버전]
-        """
-        H_img, W_img, _ = img_bgr.shape
-        H_p, W_p = grid_shape
-        K = centroids.shape[0]
-
-        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-
-        # 💡 [구조 변경]: 마스크 도화지를 순수 0으로 초기화
-        mask_overlay = np.zeros_like(img_rgb, dtype=np.uint8)
-
-        centroids_np = centroids.cpu().numpy()
-        hard_mask_kn = inhibition_mask[centroids].cpu().numpy()  # [K, N]
-        anchor_links_np = anchor_links.cpu().numpy()  # [K, K]
-
-        np.random.seed(42)  # 색상 고정
-        colors = np.random.randint(50, 255, size=(K, 3), dtype=np.uint8)
-
-        scale_y = H_img / H_p
-        scale_x = W_img / W_p
-
-        # ====================================================================
-        # PHASE 1: [K, N] 앵커 세력권 마스크 컬러링 (루프 내 OpenCV 합성 소거)
-        # ====================================================================
-        for k_idx in range(K):
-            color = colors[k_idx].tolist()
-            member_patch_indices = np.where(hard_mask_kn[k_idx])[0]
-
-            for p_idx in member_patch_indices:
-                y_p = p_idx // W_p
-                x_p = p_idx % W_p
-
-                y_start, y_end = int(y_p * scale_y), int((y_p + 1) * scale_y)
-                x_start, x_end = int(x_p * scale_x), int((x_p + 1) * scale_x)
-
-                # 💡 [핵심 해결 포인트]: 슬라이싱 구간에 고유 컬러를 그냥 원샷 대입 (= 불투명 도포)
-                # 다중 귀속(Overlapping) 패치는 나중에 칠해진 앵커 색상으로 덮어씌워지거나
-                # 평균값 처리가 되어 에러가 나지 않습니다.
-                mask_overlay[y_start:y_end, x_start:x_end] = color
-
-        # 💡 [원샷 합성]: 루프 밖에서 이미지 전체 크기로 단 한 번만 블렌딩을 가동합니다.
-        # 이 한 줄로 무겁던 내부 연산이 지워지고 OpenCV 차원 불일치 에러가 원천 소거됩니다.
-        fused_img = cv2.addWeighted(img_rgb, 1.0, mask_overlay, 0.4, 0)
-
-        # ====================================================================
-        # PHASE 2: 앵커 중심점 및 [K, K] 링크(연결선) 그리기
-        # ====================================================================
-        plt.figure(figsize=(12, 9))
-        plt.imshow(fused_img)
-        plt.axis("off")
-
-        anchor_coords_pixel = []
-        for c_idx in centroids_np:
-            y_p = c_idx // W_p
-            x_p = c_idx % W_p
-            pixel_y = int((y_p + 0.5) * scale_y)
-            pixel_x = int((x_p + 0.5) * scale_x)
-            anchor_coords_pixel.append((pixel_x, pixel_y))
-
-        # [K, K] 연결 위상선 렌더링
-        for i in range(K):
-            for j in range(K):
-                if anchor_links_np[i, j]:
-                    pt1 = anchor_coords_pixel[i]
-                    pt2 = anchor_coords_pixel[j]
-                    plt.plot(
-                        [pt1[0], pt2[0]],
-                        [pt1[1], pt2[1]],
-                        color="#FF5722",
-                        linestyle="-",
-                        linewidth=2.5,
-                        alpha=0.8,
-                        zorder=2,
-                    )
-
-        # 정예 앵커 중심점 플로팅
-        x_points = [pt[0] for pt in anchor_coords_pixel]
-        y_points = [pt[1] for pt in anchor_coords_pixel]
-        plt.scatter(
-            x_points, y_points,
-            color="#00FF00",
-            edgecolors="black",
-            s=120,
-            marker="o",
-            zorder=3,
-            label="Centroid Anchors"
-        )
-
-        plt.title(f"Localized Scene Topology Graph (Detected Object Nodes: {K})", fontsize=14)
-        plt.tight_layout()
-        plt.show()
     ###########
     def sample_object_anchors_with_k(self, k, grid_shape, num_centroids=300, spatial_radius=5):
         H_p, W_p = grid_shape

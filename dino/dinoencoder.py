@@ -13,12 +13,12 @@ from io import BytesIO
 IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 IMAGENET_STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
-DINO_PATH = '../dinov2'
-DINO_MODEL = 'dinov2_vits14'
-WEIGHTS_PATH = './dinov2_vits14.pth'
+#DINO_PATH = '../dinov2'
+#DINO_MODEL = 'dinov2_vits14'
+#WEIGHTS_PATH = './dinov2_vits14.pth'
 
 class DinoV2Encoder:
-    def __init__(self, model_type='vits14'):  # 'vits14', 'vitb14', 'vitl14', 'vitg14'
+    def __init__(self, DINO_PATH = '../dinov2', DINO_MODEL = 'dinov2_vits14', WEIGHTS_PATH = './dinov2_vits14.pth', model_type='vits14'):  # 'vits14', 'vitb14', 'vitl14', 'vitg14'
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         # 페이스북(Meta)의 공식 dinov2 모델 로드
@@ -425,13 +425,13 @@ class DinoV2Encoder:
             f"{DINOV2_BASE_URL}/{backbone_name}/"
             f"{backbone_name}_{head_dataset}_{head_type}_config.py"
         )
-        print(f"Config  다운로드: {config_url}")
+        #print(f"Config  다운로드: {config_url}")
         resp = requests.get(config_url, timeout=30)
         resp.raise_for_status()
         ns = {}
         exec(resp.text, ns)
         out_indices = list(ns["model"]["backbone"]["out_indices"])
-        print(f"out_indices: {out_indices}")
+        #print(f"out_indices: {out_indices}")
         return out_indices
 
     def load_head_checkpoint(self, head: segheader.BNHead, backbone_name, head_dataset, head_type, DINOV2_BASE_URL):
@@ -446,7 +446,7 @@ class DinoV2Encoder:
             f"{DINOV2_BASE_URL}/{backbone_name}/"
             f"{backbone_name}_{head_dataset}_{head_type}_head.pth"
         )
-        print(f"Checkpoint 다운로드: {ckpt_url}")
+        #print(f"Checkpoint 다운로드: {ckpt_url}")
         resp = requests.get(ckpt_url, stream=True, timeout=120)
         resp.raise_for_status()
 
@@ -467,7 +467,7 @@ class DinoV2Encoder:
         missing, unexpected = head.load_state_dict(head_state, strict=True)
         if missing:    print(f"[경고] Missing   : {missing}")
         if unexpected: print(f"[경고] Unexpected: {unexpected}")
-        print(f"헤드 로드 완료 ({len(head_state)} keys)")
+        #print(f"헤드 로드 완료 ({len(head_state)} keys)")
 
     def masked_average_pool(self,
             feat_map: torch.Tensor,
