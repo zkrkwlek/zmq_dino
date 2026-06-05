@@ -11,6 +11,8 @@ from dino.patchcluster import DinoSemanticObjectExtractor
 from communication.commuprocessmanager import NotificationManager, DownloadDataManager
 from communication.inferencedatamanager import ImageDataManager, XFeatDataManager, SaladDataManager, DINODataManager
 from dino.dinosemanticmatcher import DinoXFeatPatchMatcher
+from dino.visualizer import DinoPatchVisualizer
+from dino.crossattention import FrameMatchedCrossAttention
 
 from dino.segmentation import generate_pseudo_labels_by_local_density, visualize_pseudo_labels_opencv
 
@@ -51,6 +53,7 @@ def inference_loop(zmq_socket):
         salad_mgr = SaladDataManager()
         dino_mgr = DINODataManager()
         matcher = DinoXFeatPatchMatcher()
+        ca_mgr = FrameMatchedCrossAttention().cuda()
 
         while True:
             # 큐에서 작업 꺼내기
@@ -77,13 +80,51 @@ def inference_loop(zmq_socket):
             ##DINOv2
             tensor1, (W, H) = model.preprocess_cv2(img_rgb1)
             x_cat1,attn_1 = model.extract_features_with_attention(tensor1.cuda(), model.out_indices, patch_size=14, head_indices=[5])
-            t2 = time.time()
             feat1, H_p, W_p = objpatcher._prepare_features(x_cat1)
+            t2 = time.time()
+
+            ##cross attention
+            #memory bank
+            TOP_K = 5
+            selected_frames = list_neigh_frames[:TOP_K]
+            Nm = H_p*W_p*len(selected_frames)
+            Np = H_p*W_p
+            memory_bank_patches = torch.empty((Nm, 384), dtype=torch.float32, device=feat1.device)
+            global_target_indices = []
+            for i, (tsrc, tfid) in enumerate(selected_frames):
+                # 1) 현재 프레임의 DINO 패치 추출 (가상 텐서)
+                x_cat2, sample2, mask2, avg_patch_vec2, bind_xfeat_mat2 = map(
+                    lambda x: x.cuda(), dino_mgr.get(tsrc, tfid)
+                )
+                feat2,_,_ = objpatcher._prepare_features(x_cat2)
+                # 2) 텐서의 어느 위치에 넣을지 시작(start)과 끝(end) 인덱스 계산
+                start_idx = i * Np  # 0, 1024, 2048
+                end_idx = (i + 1) * Np  # 1024, 2048, 3072
+
+                # 3) 만들어둔 빈 텐서의 해당 구간에 추출한 패치 덮어쓰기 (In-place 연산)
+                memory_bank_patches[start_idx:end_idx, :] = feat2
+
+                if sample2 is not None and len(sample2) > 0:
+                    adjusted_tensor = sample2 + start_idx
+                    global_target_indices.append(adjusted_tensor)
+
+                print(f"Frame {i}, {tfid.decode()} (인덱스 {start_idx}~{end_idx}) 채워넣기 완료")
+
+            if len(list_neigh_frames) > 0:
+                if global_target_indices:
+                    global_target_indices = torch.cat(global_target_indices, dim=0).to(feat1.device)
+                else:
+                    global_target_indices = None
+                feat1, attn_1 = ca_mgr(feat1, memory_bank_patches, global_target_indices)
+
             grid_shape = (H_p, W_p)
             mask1 = objpatcher.generate_mask(feat1, grid_shape, spatial_radius=3, sim_thresh=0.65)
             sample1 = objpatcher.sample_patch(attn_1, mask1)
             affinity1 = objpatcher.build_anchor_to_patch_affinity(sample1, mask1)
-            avg_patch_vec1, _ = objpatcher.extract_sample_neighborhood_average_pool(x_cat1, affinity1)
+            avg_patch_vec1, _ = objpatcher.extract_sample_neighborhood_pure_average(feat1, affinity1)
+
+            #affinity11 = matcher.build_affinity_matrix(avg_patch_vec1, feat1)
+
             link1 = objpatcher.build_anchor_to_anchor_link(affinity1)
             bind_xfeat_mat1 = dino_mgr.bind_xfeat_to_patch(kp1, grid_shape)
             mat_sample_xfeat1 = torch.matmul(affinity1.float(), bind_xfeat_mat1)
@@ -98,6 +139,13 @@ def inference_loop(zmq_socket):
             #cv2.waitKey()
 
             t4 = time.time()
+
+            visualizer.visualize_cls_attention_opencv(img1, attn_1, grid_shape)
+            visualizer.visualize_anchor_relations(img1, sample1, mask1, link1, grid_shape)
+            visualizer.visualize_sample_to_sample_similarity(img1, sample1, avg_patch_vec1, affinity1, grid_shape)
+            cv2.waitKey(0)
+            continue
+
             ##객체 벡터 매핑
             """"""
             for (tsrc, tfid) in list_neigh_frames:
@@ -117,7 +165,7 @@ def inference_loop(zmq_socket):
                 fmat = matcher.build_affinity_matrix(desc1,desc2)
                 match_mask, match12 = matcher.compute_local_point_correspondence_batch(mat_sample_xfeat1, mat_sample_xfeat2, smat, fmat)
                 dynamic_path = "./matches/frame_" + fid.decode() + ".png"
-                matcher.visualize_global_scene_matching(img1, img2, match_mask, match12, mat_sample_xfeat1, mat_sample_xfeat2, kp1, kp2, grid_shape, grid_shape, dynamic_path)
+                visualizer.visualize_global_scene_matching(img1, img2, match_mask, match12, mat_sample_xfeat1, mat_sample_xfeat2, kp1, kp2, grid_shape, grid_shape, dynamic_path)
                 #objpatcher.visualize_patch_group_connections(img1, sample1, img2, sample2, group_affinity_counts, best_match_g2_idx, valid_group_mask, grid_shape1)
                 #print(kp2, desc2)
                 break
@@ -157,7 +205,7 @@ def inference_loop(zmq_socket):
                 smat = matcher.build_affinity_matrix(avg_patch_vec1, avg_patch_vec2)
                 fmat = matcher.build_affinity_matrix(desc1, desc2)
 
-                match_mask, match12 = matcher.compute_local_point_correspondence_batch(
+                match_mask, match12 = matcher.compute_local_point_correspondence_batch_fixed(
                     mat_sample_xfeat1, mat_sample_xfeat2, smat, fmat
                 )
 
@@ -166,7 +214,7 @@ def inference_loop(zmq_socket):
 
                 # C. 💡 [듀얼 시각화 가동]: 두 매칭 방식을 비교하여 "./matches/frame_XXXX.png" 로 저장
                 dynamic_path = "./matches3/frame_" + fid.decode()+"_"+tfid.decode() + ".png"
-                matcher.visualize_comparison_triple_canvas(
+                visualizer.visualize_comparison_triple_canvas(
                     img1_rgb=img1,
                     img2_rgb=img2,
                     final_point_pairs_mask=match_mask,
@@ -235,4 +283,5 @@ if __name__ == '__main__':
     model = load_model()
     print("Load Model 완료")
     objpatcher = DinoSemanticObjectExtractor()
+    visualizer = DinoPatchVisualizer()
     run_worker()
