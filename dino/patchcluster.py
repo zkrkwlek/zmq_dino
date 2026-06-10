@@ -3,6 +3,11 @@ import torch.nn.functional as F
 import cv2
 import numpy as np
 
+from scipy.sparse.csgraph import connected_components
+from scipy.sparse import csr_matrix
+
+import time
+
 class DinoSemanticObjectExtractor:
     def __init__(self, patch_size=14):
         self.patch_size = patch_size
@@ -12,6 +17,84 @@ class DinoSemanticObjectExtractor:
         features_norm = F.normalize(features, p=2, dim=1)
         #features_norm = features[:,-64:]
         return features_norm, H_p, W_p
+
+    def compile_structural_equivalence_vectorized(self, feat_base, sample_avg_vecs, heatmap_threshold=0.85, sim_cutoff = 0.7):
+        """
+        [진우 박사님 전용 - 코사인 유사도 행렬 반환형 고속 위상 매칭 엔진]
+        기존 아규먼트 포맷을 완벽히 보존하며, 사후 시각화 디버깅용 코사인 유사도 행렬을 함께 리턴합니다.
+        """
+        import torch
+        import torch.nn.functional as F
+        from scipy.sparse.csgraph import connected_components
+        from scipy.sparse import csr_matrix
+
+        K = sample_avg_vecs.shape[0]
+
+        # 1. 날것의 K x 1530 전역 유사도 히트맵 컴파일 (코사인 유사도 공간)
+        M_norm = F.normalize(sample_avg_vecs, p=2, dim=1)
+        F_norm = F.normalize(feat_base, p=2, dim=1)
+        H_matrix = torch.mm(M_norm, F_norm.t())  # [K, 1530]
+
+        # 👑 [박사님 핵심 지시]: 유사도가 0.65 미만인 하위 노이즈 구역은 아예 완벽한 0으로 압착
+        H_matrix_clean = torch.where(H_matrix >= sim_cutoff, H_matrix, torch.zeros_like(H_matrix))
+
+        # 2. ⚡ [핵심 추가 구역]: 0으로 정제된 히트맵 분포를 기반으로 교차 코사인 유사도 연산 (K x K)
+        H_norm = F.normalize(H_matrix_clean, p=2, dim=1)
+        heatmap_sim_matrix = torch.mm(H_norm, H_norm.t())
+        heatmap_sim_np = heatmap_sim_matrix.cpu().numpy()
+
+        # 3. 인접 행렬 변환 및 Scipy C++ 그래프 컴포넌트 일괄 색출
+        adjacency_matrix = (heatmap_sim_np >= heatmap_threshold).astype(np.int32)
+
+        n_components, group_assignments = connected_components(
+            csgraph=csr_matrix(adjacency_matrix), directed=False, connection='weak', return_labels=True
+        )
+
+        # 💡 [정정 완공]: 시각화 레이어에서 직접 룩업할 수 있도록 유사도 매트릭스(heatmap_sim_np)를 함께 리턴!
+        return group_assignments, n_components, heatmap_sim_np
+    def compile_structural_equivalence_vectorized2(self,feat_base, sample_avg_vecs, heatmap_threshold=0.85):
+        """
+        [진우 박사님 전용 - 중첩 루프를 전면 소거한 전역 히트맵 일치도 기반 고속 합병 커널]
+        Scipy C++ 가속 그래프 컴포넌트 알고리즘을 이용하여 루프 없이 원샷으로 group_assignments를 산출합니다.
+        """
+        t1 = time.time()
+        K = sample_avg_vecs.shape[0]
+
+        # 1. 전역 히트맵 행렬곱 계산 (K x 1530)
+        M_norm = F.normalize(sample_avg_vecs, p=2, dim=1)
+        F_norm = F.normalize(feat_base, p=2, dim=1)
+        H_matrix = torch.clamp(torch.mm(M_norm, F_norm.t()), min=0.0)
+
+        # 2. 히트맵 간의 교차 코사인 유사도 연산 (K x K)
+        H_norm = F.normalize(H_matrix, p=2, dim=1)
+        heatmap_sim_matrix = torch.mm(H_norm, H_norm.t())
+        heatmap_sim_np = heatmap_sim_matrix.cpu().numpy()
+
+        # ====================================================================
+        # ⚡ [박사님 지시 사항 - 중첩 for 루프 및 치환 가드 완벽 소거단]
+        # ====================================================================
+        # ① 임계값을 넘는 유효 연결 쌍들을 0과 1로 이루어진 불리언 인접 행렬로 변환 [K, K]
+        #    (상삼각 행렬만 볼 필요 없이 행렬 전역을 원샷으로 마스킹 부러뜨립니다)
+        adjacency_matrix = (heatmap_sim_np >= heatmap_threshold).astype(np.int32)
+
+        t2 = time.time()
+
+        # ② 희소 행렬 그래프 포맷(CSR)으로 압축 전송 (메모리 및 자원 극대화)
+        graph = csr_matrix(adjacency_matrix)
+        t3 = time.time()
+        # ③ 👑 [마스터 가속 커널 실행]:
+        #    C++ 기반 고속 BFS/DFS로 백트래킹하며 연결 무리들을 루프 없이 일괄 색출합니다.
+        #    labels_np 배열 내부에는 원샷 합병이 완료된 컴포넌트 ID가 자동으로 부여됩니다.
+        n_components, group_assignments = connected_components(
+            csgraph=graph,
+            directed=False,  # 무방향 그래프 체계 고수 (i,j 가 합쳐지면 j,i 도 당연히 한 몸)
+            connection='weak',  # 징검다리식 전파 연결(Transitive Closure) 조건 활성화
+            return_labels=True
+        )
+        t4 = time.time()
+        # ====================================================================
+        print('cluster test', t4-t1, t2-t1,t3-t2,t4-t3)
+        return group_assignments, heatmap_sim_np, n_components
 
     def build_anchor_to_patch_affinity_recursive(self, centroids, inhibition_mask, max_hops=1):
         """
@@ -58,16 +141,36 @@ class DinoSemanticObjectExtractor:
         # 최종 결과를 다시 Boolean 구조 [K, N] (또는 필요에 따라 float) 형태로 리턴
         return current_affinity > 0.5
 
-    def build_anchor_to_patch_affinity(self, centroids, inhibition_mask):
-        """
-        NMS로 선별된 K개의 앵커와 N개의 전체 패치 간의 공간-시맨틱 융합 관계를 추출합니다.
-        Args:
-            centroids       : [K] 형태의 1D Tensor (sample_patch 메서드의 아웃풋)
-            inhibition_mask : [N, N] 형태의 공간-시맨틱 융합 마스크 (generate_mask의 아웃풋)
-        Returns:
-            affinity_matrix : [K, N] 형태의 공간 제약형 어피니티 행렬
-        """
-        return inhibition_mask[centroids.long(), :]
+    def build_anchor_to_patch_affinity(self, centroids, inhibition_mask, sim_matrix=None, exclusive=False):
+        base_affinity = inhibition_mask[centroids.long(), :]  # [K, N]
+
+        if not exclusive:
+            return base_affinity
+
+        assert sim_matrix is not None, "exclusive=True 일 때는 sim_matrix를 넘겨주세요!"
+
+        K, N = base_affinity.shape
+        if K == 0:
+            return base_affinity
+
+        # 🌟 [최적화 핵심]: 행렬 곱(torch.mm) 연산을 아예 삭제하고,
+        # 이미 계산된 [N, N] 행렬에서 앵커에 해당하는 [K, N]만 1마이크로초만에 쓱 잘라옵니다!
+        sim = sim_matrix[centroids.long(), :]
+
+        # 원래 마스크 밖의 영역은 아예 선택되지 않도록 -9999로 밀어버림
+        masked_sim = torch.where(base_affinity, sim, torch.full_like(sim, -9999.0))
+
+        # 패치별로 가장 유사도가 높은 단 1개의 앵커 추출 [N]
+        best_anchor_indices = masked_sim.argmax(dim=0)
+        claimed_patches = base_affinity.any(dim=0)
+
+        exclusive_affinity = torch.zeros_like(base_affinity, dtype=torch.bool)
+        valid_patch_indices = torch.where(claimed_patches)[0]
+        valid_anchor_indices = best_anchor_indices[valid_patch_indices]
+
+        exclusive_affinity[valid_anchor_indices, valid_patch_indices] = True
+
+        return exclusive_affinity
 
     def build_anchor_to_anchor_link(self, affinity, min_overlap_patches = 2):
         K,N = affinity.shape
@@ -104,7 +207,7 @@ class DinoSemanticObjectExtractor:
         spatial_mask = (dist_matrix < spatial_radius)
 
         inhibition_mask = spatial_mask & semantic_mask
-        return inhibition_mask
+        return inhibition_mask, sim_matrix
 
     def sample_patch(self, attn, mask, num_centroids = 50):
         scores = attn[0]
@@ -177,7 +280,7 @@ class DinoSemanticObjectExtractor:
 
         # 박사님 지시대로 최종 단의 F.normalize 과정을 원천 삭제하여 순수 물리 값 보존
         return sample_avg_vecs, n_patches_per_sample
-    def extract_sample_neighborhood_average_pool(self, x_cat, affinity):
+    def extract_sample_neighborhood_average_pool(self, x_cat, affinity, attn=None):
         """
         [진우 박사님 낭비 제로 최적화]
         이미 계산된 [K, N] 크기의 affinity 마스크를 그대로 재활용하여
@@ -194,24 +297,32 @@ class DinoSemanticObjectExtractor:
         device = x_cat.device
         _, D, _, _ = x_cat.shape
         feat_flat = x_cat[0].view(D, -1).t()
-        print("asdf", affinity.shape)
+
         K, N = affinity.shape
         if K == 0:
             return torch.empty((0, feat_flat.shape[1]), device=device), torch.zeros(0, device=device)
 
         # 1. 💡 [중복 연산 전면 소거]: 기존의 유사도 계산 및 임계값 마스킹 단계를 완전히 생략하고
         # 인풋으로 들어온 affinity를 float 형태로 가중치 매트릭스로 즉시 채택합니다.
-        masks_bool = affinity.float()  # [K, N]
+        masks_float = affinity.float()  # [K, N]
+
+        ##가중치 부여
+        if attn is not None:
+            weights = masks_float * attn.float()
+        else:
+            weights = masks_float
 
         # 2. 각 샘플별 그룹에 귀속된 유효 패치 개수(면적) 계산 [K]
-        n_patches_per_sample = masks_bool.sum(dim=1)  # [K]
+        n_patches_per_sample = masks_float.sum(dim=1)  # [K]
+
+        weight_sums = weights.sum(dim=1)
 
         # 3. 🚀 [거대 행렬 곱 딱 한 방]: 마스크 행렬 [K, N] @ 오리지널 피처 행렬 [N, D]
         # 원본 feat_flat의 묵직한 활성화 강도를 그대로 유지한 채 영역별 합산 처리
-        sum_vecs = torch.mm(masks_bool, feat_flat.float())  # [K, D]
+        sum_vecs = torch.mm(weights, feat_flat.float())  # [K, D]
 
         # 4. 평균 계산 및 0분모 방지 예외 처리
-        denom = n_patches_per_sample.unsqueeze(1)  # [K, 1]
+        denom = weight_sums.unsqueeze(1)  # [K, 1]
         sample_avg_vecs = torch.where(denom > 0, sum_vecs / denom, torch.zeros_like(sum_vecs))
 
         # 5. 최종 코사인 유사도 매칭 오퍼레이션을 위해 출력 벡터만 L2 정규화 종결

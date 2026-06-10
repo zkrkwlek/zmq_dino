@@ -11,7 +11,7 @@ from dino.patchcluster import DinoSemanticObjectExtractor
 from communication.commuprocessmanager import NotificationManager, DownloadDataManager
 from communication.inferencedatamanager import ImageDataManager, XFeatDataManager, SaladDataManager, DINODataManager
 from dino.dinosemanticmatcher import DinoXFeatPatchMatcher
-from dino.visualizer import DinoPatchVisualizer
+from dino.visualizer import DinoPatchVisualizer, UnifiedAttentionDirectVectorVisualizer
 from dino.crossattention import FrameMatchedCrossAttention
 
 from dino.segmentation import generate_pseudo_labels_by_local_density, visualize_pseudo_labels_opencv
@@ -85,7 +85,7 @@ def inference_loop(zmq_socket):
 
             ##cross attention
             #memory bank
-            TOP_K = 5
+            TOP_K = 1
             selected_frames = list_neigh_frames[:TOP_K]
             Nm = H_p*W_p*len(selected_frames)
             Np = H_p*W_p
@@ -115,13 +115,16 @@ def inference_loop(zmq_socket):
                     global_target_indices = torch.cat(global_target_indices, dim=0).to(feat1.device)
                 else:
                     global_target_indices = None
-                feat1, attn_1 = ca_mgr(feat1, memory_bank_patches, global_target_indices)
+                afeat1, aattn_1 = ca_mgr(feat1, memory_bank_patches, global_target_indices)
 
             grid_shape = (H_p, W_p)
-            mask1 = objpatcher.generate_mask(feat1, grid_shape, spatial_radius=3, sim_thresh=0.65)
+            mask1, sim_mat1 = objpatcher.generate_mask(feat1, grid_shape, spatial_radius=3, sim_thresh=0.7)
             sample1 = objpatcher.sample_patch(attn_1, mask1)
-            affinity1 = objpatcher.build_anchor_to_patch_affinity(sample1, mask1)
-            avg_patch_vec1, _ = objpatcher.extract_sample_neighborhood_pure_average(feat1, affinity1)
+
+            affinity1 = objpatcher.build_anchor_to_patch_affinity(sample1, mask1, sim_mat1, exclusive=True)
+            avg_patch_vec1, _ = objpatcher.extract_sample_neighborhood_average_pool(x_cat1, affinity1, attn_1)
+            # patch cluster
+            group1, n_comp1, heat1 = objpatcher.compile_structural_equivalence_vectorized(feat1, avg_patch_vec1)
 
             #affinity11 = matcher.build_affinity_matrix(avg_patch_vec1, feat1)
 
@@ -140,14 +143,15 @@ def inference_loop(zmq_socket):
 
             t4 = time.time()
 
-            visualizer.visualize_cls_attention_opencv(img1, attn_1, grid_shape)
+            #visualizer.visualize_cls_attention_opencv(img1, attn_1, grid_shape)
             visualizer.visualize_anchor_relations(img1, sample1, mask1, link1, grid_shape)
             visualizer.visualize_sample_to_sample_similarity(img1, sample1, avg_patch_vec1, affinity1, grid_shape)
-            cv2.waitKey(0)
-            continue
+            visualizer.visualize_new_structural_grouping(img1, sample1, affinity1, group1, heat1, n_comp1, grid_shape)
+            #cv2.waitKey(0)
+            #continue
 
             ##객체 벡터 매핑
-            """"""
+            """
             for (tsrc, tfid) in list_neigh_frames:
                 #print(tsrc, tfid)
                 img2 = img_mgr.get(tsrc, tfid)
@@ -169,7 +173,7 @@ def inference_loop(zmq_socket):
                 #objpatcher.visualize_patch_group_connections(img1, sample1, img2, sample2, group_affinity_counts, best_match_g2_idx, valid_group_mask, grid_shape1)
                 #print(kp2, desc2)
                 break
-
+            """
             """"""
             best_target = None
             max_temporal_dist = -1
@@ -199,6 +203,7 @@ def inference_loop(zmq_socket):
                 x_cat2, sample2, mask2, avg_patch_vec2, bind_xfeat_mat2 = map(
                     lambda x: x.cuda(), dino_mgr.get(tsrc, tfid)
                 )
+                feat2, _, _ = objpatcher._prepare_features(x_cat2)
                 affinity2 = objpatcher.build_anchor_to_patch_affinity(sample2, mask2)
                 mat_sample_xfeat2 = torch.matmul(affinity2.float(), bind_xfeat_mat2)
 
@@ -212,8 +217,18 @@ def inference_loop(zmq_socket):
                 # B. 주석 해제된 오리지널 XFeat 순정 매칭 결과 추출 (박사님 원본 match_xfeat_desc 활용)
                 idx1, idx2 = xfeat_mgr.match_xfeat_desc(desc1, desc2)
 
+                #어텐션 비교
+                unified_engine = UnifiedAttentionDirectVectorVisualizer(grid_shape=(34, 45))
+                unified_engine.start_unified_direct_vector_viewer(
+                    img1,  # Frame 1 이미지 변수
+                    img2,  # Frame 2 이미지 변수
+                    feat1,
+                    feat2, avg_patch_vec1,
+                    affinity1  # 기준 프레임 고유의 마스크 행렬
+                    #,sample1, group1,n_comp1
+                )
                 # C. 💡 [듀얼 시각화 가동]: 두 매칭 방식을 비교하여 "./matches/frame_XXXX.png" 로 저장
-                dynamic_path = "./matches3/frame_" + fid.decode()+"_"+tfid.decode() + ".png"
+                dynamic_path = "./matches5/frame_" + fid.decode()+"_"+tfid.decode() + ".png"
                 visualizer.visualize_comparison_triple_canvas(
                     img1_rgb=img1,
                     img2_rgb=img2,
@@ -231,7 +246,7 @@ def inference_loop(zmq_socket):
                 )
 
             etime = time.time()
-            #cv2.waitKey()
+            cv2.waitKey()
             print("처리", fid, etime-stime, len(list_neigh_frames), " salad 처리 = ", t1-stime, ", 디노 인코딩 = ", t2-t1, ", 디노 패치 벡터 = ", t3-t2, etime-t4)
 
 

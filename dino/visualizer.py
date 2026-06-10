@@ -1,9 +1,189 @@
+import matplotlib.pyplot as plt
+import os
+
 import cv2
 import numpy as np
-import matplotlib.pyplot as plt
 import torch
 import torch.nn.functional as F
-import os
+
+class UnifiedAttentionDirectVectorVisualizer:
+    """
+    [진우 박사님 전용 - 중복 연산 제로 & 이미 구해진 평균 패치 벡터 직결형 종합 디버거]
+    내부에서 평균 벡터를 다시 구하지 않고, 박사님이 완성하신 sample_avg_vecs를 그대로 전달받아
+    셀프 및 크로스 어텐션 히트맵을 1:1 순정 크기로 투사합니다.
+    """
+
+    def __init__(self, grid_shape=(34, 45)):
+        self.Hp, self.Wp = grid_shape
+        self.N = self.Hp * self.Wp
+
+        # 순정 데이터 버퍼
+        self.img_base = None
+        self.img_neigh = None
+        self.feat_base = None
+        self.feat_neigh = None
+
+        # 💡 [박사님 핵심 지시 버퍼]: 외부에서 완공된 평균 벡터 및 세력권 매핑 매트릭스
+        self.sample_avg_vecs = None  # [K, D] 이미 구해놓은 사물별 대표 평균 벡터 행렬
+        self.affinity_base = None  # [K, N] 또는 [N, N] 패치가 어느 사물(K)에 속해있는지 나타내는 매핑 마스크
+
+        self.base_h, self.base_w = 0, 0
+        self.neigh_h, self.neigh_w = 0, 0
+        self.window_name = "JinWoo_Doctor_DirectVector_Viewer"
+
+    def _mouse_callback(self, event, x, y, flags, param):
+        if event == cv2.EVENT_LBUTTONDOWN:
+            if x >= self.base_w:
+                return
+
+            # 원본 스케일 기반 패치 격자 역산
+            step_w = self.base_w / self.Wp
+            step_h = self.base_h / self.Hp
+
+            patch_x = max(0, min(int(x / step_w), self.Wp - 1))
+            patch_y = max(0, min(int(y / step_h), self.Hp - 1))
+            target_patch_idx = patch_y * self.Wp + patch_x
+
+            # ⚡ 외부 주입 벡터 기반으로 원샷 히트맵 리프레시
+            self._render_heatmaps_with_precomputed_vector(target_patch_idx, patch_x, patch_y)
+
+    def _render_heatmaps_with_precomputed_vector(self, target_patch_idx, patch_x, patch_y):
+        """💡 [중복 계산 금지 구역]: 전달받은 sample_avg_vecs에서 선택된 사물의 대표 벡터를 즉시 룩업합니다."""
+
+        # 1. 사용자가 클릭한 패치가 '몇 번 사물 인덱스(k)'에 속해있는지 조사
+        if self.affinity_base.shape[0] == self.N:
+            # [N, N] 구조인 경우: 자기 자신이 곧 앵커 인덱스
+            target_k_idx = target_patch_idx
+            # 시각화 가이드를 위한 마스크 면적 계산
+            n_patches = self.affinity_base[target_patch_idx].float().sum().item()
+        else:
+            # [K, N] 구조인 경우: 해당 패치 열에서 1이 켜진 사물 행(k)을 룩업
+            connected_rows = torch.where(self.affinity_base[:, target_patch_idx] > 0)[0]
+            if connected_rows.numel() == 0:
+                print(f"⚠️ [직결 엔진] 패치 {target_patch_idx}가 포섭된 사물 채널(K)을 찾을 수 없습니다.")
+                return
+            target_k_idx = connected_rows[0].item()
+            n_patches = self.affinity_base[target_k_idx].float().sum().item()
+
+        # 2. 🎯 [박사님 핵심 의도]: 다시 더하고 나눌 필요 없이, 이미 구해서 인풋으로 넘어온 고유 평균 벡터 슬라이싱!
+        # [K, D] -> [1, D]
+        pure_avg_vec_base = self.sample_avg_vecs[target_k_idx].view(1, -1)
+
+        # 4. 🚀 [교정 셀프 어텐션] -> 왼쪽 캔버스 배포
+        self_scores = torch.mm(self.feat_base, pure_avg_vec_base.t()).squeeze()
+        self_map_2d = self_scores.view(self.Hp, self.Wp).cpu().numpy()
+
+        # 5. 🚀 [교정 크로스 어텐션] -> 오른쪽 캔버스 배포 (위치 고착 버그 완전 폭파 지점)
+        cross_scores = torch.mm(self.feat_neigh, pure_avg_vec_base.t()).squeeze()
+        cross_map_2d = cross_scores.view(self.Hp, self.Wp).cpu().numpy()
+
+        # 6. 고해상도 오버레이 렌더링 컴파일
+        def _generate_heatmap_overlay(attn_2d, orig_img, target_h, target_w):
+            attn_2d = np.clip(attn_2d, 0.0, 1.0)
+            a_min, a_max = attn_2d.min(), attn_2d.max()
+            a_norm = (attn_2d - a_min) / (a_max - a_min + 1e-8)
+            h_src = (a_norm * 255).astype(np.uint8)
+            h_res = cv2.resize(h_src, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+            h_col = cv2.applyColorMap(h_res, cv2.COLORMAP_JET)
+            return cv2.addWeighted(orig_img, 0.6, h_col, 0.4, 0, dtype=cv2.CV_8U)
+
+        vis_left_bgr = _generate_heatmap_overlay(self_map_2d, self.img_base, self.base_h, self.base_w)
+        vis_right_bgr = _generate_heatmap_overlay(cross_map_2d, self.img_neigh, self.neigh_h, self.neigh_w)
+
+        # 원본 해상도 위에 그릴 투명 그리드 캔버스 생성
+        grid_overlay = vis_left_bgr.copy()
+        step_w = self.base_w / self.Wp
+        step_h = self.base_h / self.Hp
+
+        # 세로 격자선 드로잉 (X축 이동)
+        for w_idx in range(1, self.Wp):
+            x_pos = int(w_idx * step_w)
+            cv2.line(grid_overlay, (x_pos, 0), (x_pos, self.base_h), (255, 255, 0), 1, cv2.LINE_AA)
+        # 가로 격자선 드로잉 (Y축 이동)
+        for h_idx in range(1, self.Hp):
+            y_pos = int(h_idx * step_h)
+            cv2.line(grid_overlay, (0, y_pos), (self.base_w, y_pos), (255, 255, 0), 1, cv2.LINE_AA)
+
+        if self.affinity_base.shape[0] == self.N:
+            # [N, N] 구조인 경우 각 행의 합이 0보다 큰지 검사
+            valid_mask_1d = (self.affinity_base.sum(dim=1) > 0).cpu().numpy()
+        else:
+            # [K, N] 구조인 경우 각 열(패치)에 1이라도 켜져 있는지 전역 논리합 추출 [N]
+            valid_mask_1d = torch.any(self.affinity_base > 0, dim=0).cpu().numpy()
+
+        valid_indices = np.where(valid_mask_1d)[0]
+
+        # 1D 인덱스들을 2D 격자 좌표 (wp_idx, hp_idx)로 일괄 환원
+        wp_indices = valid_indices % self.Wp
+        hp_indices = valid_indices // self.Wp
+
+        # 넘파이 벡터 연산으로 원소별 중앙 픽셀 좌표 리스트 빌드
+        center_xs = ((wp_indices + 0.5) * step_w).astype(np.int32)
+        center_ys = ((hp_indices + 0.5) * step_h).astype(np.int32)
+
+        # OpenCV 고속 드로잉 바인딩 (C++ 가속단으로 바로 전달되므로 지연시간 제로)
+        for pt_x, pt_y in zip(center_xs, center_ys):
+            cv2.circle(grid_overlay, (pt_x, pt_y), 2, (0, 165, 255), -1, cv2.LINE_AA)
+
+        # 원본 히트맵과 격자망을 85:15 비율로 블렌딩하여 은은하게 노출 (시야 방해 제거)
+        vis_left_bgr = cv2.addWeighted(vis_left_bgr, 0.85, grid_overlay, 0.15, 0)
+
+        # 7. 클릭 마커 드로잉
+        step_w = self.base_w / self.Wp
+        step_h = self.base_h / self.Hp
+        x1, y1 = int(patch_x * step_w), int(patch_y * step_h)
+        x2, y2 = int((patch_x + 1) * step_w), int((patch_y + 1) * step_h)
+        cv2.rectangle(vis_left_bgr, (x1, y1), (x2, y2), (0, 255, 0), 2, cv2.LINE_AA)
+
+        # 8. 👑 [순정 마스터 캔버스 합성 및 강제 크기 리사이즈 동기화]
+        master_canvas = np.zeros((self.base_h, self.base_w + self.neigh_w, 3), dtype=np.uint8)
+        master_canvas[:, :self.base_w] = vis_left_bgr
+        master_canvas[:, self.base_w:] = vis_right_bgr
+
+        # 안내 자막 임베딩
+        info_left = f"FRAME 1 (SELF) | Clicked: {target_patch_idx} (Object Channel k: {target_k_idx}) | Area: {int(n_patches)}"
+        info_right = "FRAME 2 (CROSS - PURE MATCHING)"
+        cv2.putText(master_canvas, info_left, (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2, cv2.LINE_AA)
+        cv2.putText(master_canvas, info_right, (self.base_w + 15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2,
+                    cv2.LINE_AA)
+        cv2.line(master_canvas, (self.base_w, 0), (self.base_w, self.base_h), (255, 255, 255), 2)
+
+        # 화면 해상도 1:1 칼같이 강착
+        cv2.resizeWindow(self.window_name, self.base_w + self.neigh_w, self.base_h)
+        cv2.imshow(self.window_name, master_canvas)
+
+    def start_unified_direct_vector_viewer(
+            self, img_bgr_base, img_bgr_neighbor, feat_base, feat_neighbor, sample_avg_vecs, affinity_base
+    ):
+        """💡 [호출 인터페이스 커스텀]: 박사님이 구하신 sample_avg_vecs를 다이렉트로 전달받습니다."""
+        self.base_h, self.base_w, _ = img_bgr_base.shape
+        self.neigh_h, self.neigh_w, _ = img_bgr_neighbor.shape
+
+        self.img_base = img_bgr_base.copy()
+        self.img_neigh = img_bgr_neighbor.copy()
+        self.feat_base = feat_base
+        self.feat_neigh = feat_neighbor
+
+        # 👑 박사님 고유 전처리 자산 바인딩
+        self.sample_avg_vecs = sample_avg_vecs
+        self.affinity_base = affinity_base
+
+        cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(self.window_name, self.base_w + self.neigh_w, self.base_h)
+        cv2.setMouseCallback(self.window_name, self._mouse_callback)
+
+        # 가동 시 초기 정중앙 패치 기준으로 팝업 개설
+        self._render_heatmaps_with_precomputed_vector((self.Hp // 2) * self.Wp + (self.Wp // 2), self.Wp // 2,
+                                                      self.Hp // 2)
+
+        while True:
+            if cv2.getWindowProperty(self.window_name, cv2.WND_PROP_VISIBLE) < 1:
+                break
+            if cv2.waitKey(10) & 0xFF == ord('q'):
+                break
+
+        cv2.destroyWindow(self.window_name)
+        return
 
 class DinoPatchVisualizer:
     def __init__(self):
@@ -887,3 +1067,103 @@ class DinoPatchVisualizer:
         cv2.waitKey(1)  # ZeroMQ나 실시간 스트리밍 루프 내에서 블로킹 방지
 
         return blended
+
+    def visualize_new_structural_grouping(self, img_bgr, centroids, affinity, group_assignments, heatmap_sim_np,
+                                          n_components, grid_shape=(34, 45), alpha=0.5):
+
+        H_img, W_img, _ = img_bgr.shape
+        H_p, W_p = grid_shape
+        K, N = affinity.shape  # K: 대표 앵커 개수, N: 전체 패치 개수(1530)
+
+        # 1. 고유 그룹 분류 및 결정론적 색상표 룩업
+        unique_groups = np.unique(group_assignments)
+
+        # 디버깅 가시성을 위해 무작위 고유 컬러 맵 구축
+        color_map = {g_id: self.colors[idx] for idx, g_id in enumerate(unique_groups)}
+
+        # 2. 채색 도화지 및 기하학적 스케일 팩터 준비
+        mask_overlay = np.zeros_like(img_bgr, dtype=np.uint8)
+        hard_mask_kn = affinity.cpu().numpy() if hasattr(affinity, "cpu") else np.array(affinity)
+        centroids_np = centroids.cpu().numpy() if hasattr(centroids, "cpu") else np.array(centroids)
+
+        scale_y = H_img / H_p
+        scale_x = W_img / W_p
+        sample_text_positions = []
+
+        # ====================================================================
+        # PHASE 1: 외부 주입 group_assignments 기반 세력권 채색 및 센트로이드 추출
+        # ====================================================================
+        for k_idx in range(K):
+            belonging_group = group_assignments[k_idx]
+            color = color_map[belonging_group]
+
+            # 💡 진짜 대표 샘플(Centroid) 패치 인덱스를 가져와 2D 픽셀 중심 좌표 산출
+            c_patch_idx = centroids_np[k_idx]
+            c_y_p = c_patch_idx // W_p
+            c_x_p = c_patch_idx % W_p
+
+            sample_center_x = int((c_x_p + 0.5) * scale_x)
+            sample_center_y = int((c_y_p + 0.5) * scale_y)
+
+            # 위상 매핑 주소록에 저장
+            sample_text_positions.append((sample_center_x, sample_center_y, belonging_group, k_idx))
+
+            # 해당 시드 채널에 포섭된 하위 자식 패치 영역들 일괄 채색
+            member_patch_indices = np.where(hard_mask_kn[k_idx] > 0.5)[0]
+            for p_idx in member_patch_indices:
+                y_p = p_idx // W_p
+                x_p = p_idx % W_p
+
+                y_start, y_end = int(y_p * scale_y), int((y_p + 1) * scale_y)
+                x_start, x_end = int(x_p * scale_x), int((x_p + 1) * scale_x)
+                mask_overlay[y_start:y_end, x_start:x_end] = color
+
+        # 원본 이미지 위에 알파 블렌딩 합성
+        fused_img = cv2.addWeighted(img_bgr, 1.0 - alpha, mask_overlay, alpha, 0)
+
+        # ====================================================================
+        # PHASE 2: 💥 [박사님 요구 스펙] 동일 그룹 간 위상 연결선 및 날것의 코사인 유사도 텍스트 작도
+        # ====================================================================
+        line_overlay = fused_img.copy()
+
+        for i in range(len(sample_text_positions)):
+            for j in range(i + 1, len(sample_text_positions)):
+                pt1_x, pt1_y, g_id1, k_i = sample_text_positions[i]
+                pt2_x, pt2_y, g_id2, k_j = sample_text_positions[j]
+
+                # 두 시드가 동일 그룹 제국으로 판정되어 묶였다면 위상선 개설
+                if g_id1 == g_id2:
+                    line_color = color_map[g_id1]
+                    cv2.line(line_overlay, (pt1_x, pt1_y), (pt2_x, pt2_y), line_color, 2, cv2.LINE_AA)
+
+                    # 💡 [핵심 가치 추가]: 두 시드가 '실제 몇의 코사인 유사도'로 묶였는지 선 정중앙에 수치 인쇄
+                    cos_sim_val = heatmap_sim_np[k_i, k_j]
+                    mid_x, mid_y = int((pt1_x + pt2_x) / 2), int((pt1_y + pt2_y) / 2)
+                    sim_text = f"{cos_sim_val:.2f}"
+                    cv2.putText(line_overlay, sim_text, (mid_x - 10, mid_y), cv2.FONT_HERSHEY_SIMPLEX, 0.3,
+                                (0, 255, 255), 1, cv2.LINE_AA)
+
+        # 선 레이어 투명도 동기화 융합
+        fused_img = cv2.addWeighted(fused_img, 0.3, line_overlay, 0.7, 0)
+
+        # ====================================================================
+        # PHASE 3: 센트로이드 노드 좌표계 위에 명확한 그룹 번호 안착
+        # ====================================================================
+        for s_x, s_y, g_id, _ in sample_text_positions:
+            id_text = f"G:{g_id}"
+            # 검은색 테두리 그림자
+            cv2.putText(fused_img, id_text, (s_x - 12, s_y + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 0, 0), 2,
+                        cv2.LINE_AA)
+            # 흰색 본문 글자
+            cv2.putText(fused_img, id_text, (s_x - 12, s_y + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1,
+                        cv2.LINE_AA)
+
+        # 시스템 모니터링 전역 헤더 박스 임베딩
+        title_text = f"New Structural Equivalence Map (Anchors: {K} -> Merged Entities: {n_components})"
+        cv2.putText(fused_img, title_text, (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
+
+        # 💡 독립된 단독 OpenCV 창으로 분리 팝업
+        cv2.imshow("New_Structural_Equivalence_Map_Window", fused_img)
+        cv2.waitKey(1)
+
+        return fused_img

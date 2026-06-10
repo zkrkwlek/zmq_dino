@@ -12,7 +12,7 @@ class FrameMatchedCrossAttention(nn.Module):
         self.head_dim = embed_dim // num_heads  # 384 // 6 = 64
         #self.scale = self.head_dim ** -0.5
         self.logit_scale = nn.Parameter(torch.ones([]) * 2.6592)  # exp(2.6592) ≒ 14.2 (CLIP 기본값)
-        self.gamma = nn.Parameter(torch.zeros(1))
+        self.gamma = nn.Parameter(torch.ones(1)*0.1) #zeros
 
         # Q, K, V 프로젝션 (384차원 유지)
         self.q_proj = nn.Linear(embed_dim, embed_dim)
@@ -47,14 +47,14 @@ class FrameMatchedCrossAttention(nn.Module):
 
         # 3. 정보 융합 및 출력
         fused = torch.matmul(attn_probs, V).transpose(0,1).contiguous().view(N_c, C)
-        output = current_patches + self.gamma * self.out_proj(fused)
+        output = current_patches + self.gamma * fused#self.out_proj(fused)
 
         # attention
         last_head_attn = attn_probs[-1]  # [1530, 3060] (마지막 헤드 사용)
         #last_head_attn = attn_probs.mean(dim=0)
         if target_indices is not None and len(target_indices) > 0:
             target_attn = last_head_attn[:, target_indices]
-            final_heatmap = target_attn.mean(dim=1).unsqueeze(0)
+            final_heatmap = target_attn.max(dim=1).values.unsqueeze(0)
             print(final_heatmap.shape)
             return output, final_heatmap
         else:

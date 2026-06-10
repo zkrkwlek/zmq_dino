@@ -208,22 +208,6 @@ class DinoV2Encoder:
 
         return x_cat, cls_attn
 
-
-    def seg_head_forward(
-            self,
-            x_cat: torch.Tensor,  # extract_features()의 출력을 그대로 받음
-            original_hw: tuple,  # (H, W) — upsample 목표 크기
-    ) -> torch.Tensor:
-        """
-        x_cat을 받아서 세그멘테이션 logits 반환.
-        백본 없이 헤드만 독립 실행 가능.
-        """
-        H, W = original_hw
-        logits = self.head(x_cat)  # (B, num_classes, h, w)
-        logits = F.interpolate(logits, size=(H, W),
-                               mode='bilinear', align_corners=False)  # (B, num_classes, H, W)
-        return logits
-
     def preprocess_cv2(self, img_rgb: np.ndarray, patch_size=14, target_size=None):
         H, W = img_rgb.shape[:2]
 
@@ -243,182 +227,6 @@ class DinoV2Encoder:
         tensor = torch.from_numpy(img_np).permute(2, 0, 1).unsqueeze(0)
         return tensor, (W, H)
 
-    @torch.no_grad()
-    def encode_image(self, image_bgr):
-        pass
-
-    @torch.no_grad()
-    def encode_object(self, image_bgr, bbox, contour=None):
-        """
-        image_bgr : OpenCV BGR 이미지 (H, W, 3), numpy
-        bbox      : [x1, y1, x2, y2], tensor or numpy
-        contour   : (N, 2) tensor or numpy, 없으면 배경 제거 생략
-        반환      : (1, M) torch.Tensor on GPU, L2 정규화됨
-        """
-        # 1. bbox crop
-        if isinstance(bbox, torch.Tensor):
-            bbox = bbox.cpu().numpy()
-        x1, y1, x2, y2 = bbox.astype(np.int32)
-        x1, y1 = max(0, x1), max(0, y1)
-        x2, y2 = min(image_bgr.shape[1], x2), min(image_bgr.shape[0], y2)
-
-        roi = image_bgr[y1:y2, x1:x2].copy()
-        if roi.size == 0:
-            return None
-
-        # 2. 배경 제거 (contour 있을 때만)
-        if contour is not None:
-            if isinstance(contour, torch.Tensor):
-                contour = contour.cpu().numpy()
-
-            # contour 좌표를 crop 기준으로 변환
-            contour_local = contour.astype(np.int32) - np.array([x1, y1])
-
-            # 마스크 생성
-            mask = np.zeros(roi.shape[:2], dtype=np.uint8)
-            cv2.fillPoly(mask, [contour_local], 255)
-
-            # ImageNet mean으로 배경 채우기 (0이 아닌 중립값)
-            imagenet_mean_bgr = np.array([0.406, 0.456, 0.485], dtype=np.float32) * 255
-            bg = np.full_like(roi, imagenet_mean_bgr, dtype=np.float32)
-            roi = np.where(mask[:, :, None] > 0, roi.astype(np.float32), bg)
-            roi = roi.astype(np.uint8)
-
-        # 3. BGR → RGB → PIL → transform
-        roi_rgb = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
-        pil_img = Image.fromarray(roi_rgb)
-        input_tensor = self.transform(pil_img).unsqueeze(0).to(self.device)
-
-        # 4. DINOv2 추론 (CLS token)
-        features = self.model(input_tensor)  # (1, M)
-
-        # 5. L2 정규화
-        features = F.normalize(features, p=2, dim=1)
-
-        return features  # GPU Tensor (1, M)
-
-    @torch.no_grad()
-    def encode_objects_batch(self, image_bgr, seg_objects):
-        """
-        모든 crop을 하나의 배치로 묶어 단일 forward pass
-        """
-        tensors = []
-        valid_ids = []
-
-        for i, obj in enumerate(seg_objects):
-            # bbox crop
-            bbox = obj['bbox']
-            if isinstance(bbox, torch.Tensor):
-                bbox = bbox.cpu().numpy()
-            x1, y1, x2, y2 = bbox.astype(np.int32)
-            x1, y1 = max(0, x1), max(0, y1)
-            x2, y2 = min(image_bgr.shape[1], x2), min(image_bgr.shape[0], y2)
-
-            roi = image_bgr[y1:y2, x1:x2].copy()
-            if roi.size == 0:
-                continue
-
-            # 배경 제거
-            contour = obj['contour']
-            if contour is not None:
-                if isinstance(contour, torch.Tensor):
-                    contour = contour.cpu().numpy()
-                contour_local = contour.astype(np.int32) - np.array([x1, y1])
-                mask = np.zeros(roi.shape[:2], dtype=np.uint8)
-                cv2.fillPoly(mask, [contour_local], 255)
-                imagenet_mean_bgr = np.array([0.406, 0.456, 0.485]) * 255
-                bg = np.full_like(roi, imagenet_mean_bgr, dtype=np.float32)
-                roi = np.where(mask[:, :, None] > 0, roi.astype(np.float32), bg)
-                roi = roi.astype(np.uint8)
-
-            # transform만 적용 (model 호출 X)
-            roi_rgb = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
-            pil_img = Image.fromarray(roi_rgb)
-            tensors.append(self.transform(pil_img))  # (3, 224, 224)
-            """
-            roi_tensor = torch.from_numpy(roi_rgb).permute(2, 0, 1).float() / 255.0
-            roi_tensor = TF.resize(roi_tensor, [224, 224],
-                                   interpolation=TF.InterpolationMode.BICUBIC)
-            roi_tensor = TF.normalize(roi_tensor,
-                                      mean=[0.485, 0.456, 0.406],
-                                      std=[0.229, 0.224, 0.225])
-            tensors.append(roi_tensor)
-            """
-            valid_ids.append(i)
-
-        if not tensors:
-            return None, []
-
-        # ★ 핵심: 단일 forward pass
-        batch = torch.stack(tensors).to(self.device)  # (N, 3, 224, 224)
-        features = self.model(batch)  # (N, M) — 1회 추론
-        features = F.normalize(features, p=2, dim=1)  # (N, M)
-
-        return features, valid_ids
-
-    @torch.no_grad()
-    def encode_objects_batch2(self, image_bgr, seg_objects):
-        """
-        프레임 내 모든 객체를 배치로 인코딩 (효율적)
-        image_bgr  : OpenCV BGR 이미지
-        seg_objects: matcher.seg_storage[src][fid]['objects'] 리스트
-        반환       : (N, M) torch.Tensor on GPU
-        """
-        tensors = []
-        valid_ids = []
-
-        for i, obj in enumerate(seg_objects):
-            a = time.time()
-            t = self.encode_object(
-                image_bgr,
-                bbox=obj['bbox'],
-                contour=obj['contour']
-            )
-            b = time.time()
-            if t is not None:
-                tensors.append(t)
-                valid_ids.append(i)
-            c = time.time()
-            print('batch', i, b-a, c-b, c-a)
-
-        if not tensors:
-            return None, []
-
-        batch = torch.cat(tensors, dim=0)  # (N, M)
-        print('dino res', batch.shape)
-        return batch, valid_ids  # GPU Tensor + 유효 인덱스
-
-    @torch.no_grad()
-    def encode_mask(self, image, mask):
-        """
-        image: OpenCV BGR 이미지 (H, W, 3)
-        mask: 해당 객체의 Binary Mask (H, W), 값은 0 또는 255 (혹은 True/False)
-        """
-        # 1. 마스크 영역 추출 (Bounding Box 크롭)
-        y, x = np.where(mask > 0)
-        if len(x) == 0 or len(y) == 0:
-            return None
-
-        x1, y1, x2, y2 = x.min(), y.min(), x.max(), y.max()
-        roi = image[y1:y2 + 1, x1:x2 + 1]
-
-        # 2. 배경 제거 (선택 사항: 객체 특징만 부각시키기 위해 마스크 적용)
-        # roi_mask = mask[y1:y2+1, x1:x2+1]
-        # roi = cv2.bitwise_and(roi, roi, mask=roi_mask.astype(np.uint8))
-
-        # 3. PIL 변환 및 전처리
-        roi_rgb = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
-        pil_img = Image.fromarray(roi_rgb)
-        input_tensor = self.transform(pil_img).unsqueeze(0).to(self.device)
-
-        # 4. 특징 추출 (CLS 토큰 사용)
-        features = self.model(input_tensor)  # (1, embedding_dim)
-
-        # 5. L2 정규화 (코사인 유사도 계산을 위해 필수)
-        features = F.normalize(features, p=2, dim=1)
-
-        return features.cpu().numpy()  # (1, M) 형태의 numpy 배열 반환
-
     def fetch_out_indices(self, backbone_name, head_dataset, head_type, DINOV2_BASE_URL):
 
         config_url = (
@@ -434,6 +242,20 @@ class DinoV2Encoder:
         #print(f"out_indices: {out_indices}")
         return out_indices
 
+    def seg_head_forward(
+            self,
+            x_cat: torch.Tensor,  # extract_features()의 출력을 그대로 받음
+            original_hw: tuple,  # (H, W) — upsample 목표 크기
+    ) -> torch.Tensor:
+        """
+        x_cat을 받아서 세그멘테이션 logits 반환.
+        백본 없이 헤드만 독립 실행 가능.
+        """
+        H, W = original_hw
+        logits = self.head(x_cat)  # (B, num_classes, h, w)
+        logits = F.interpolate(logits, size=(H, W),
+                               mode='bilinear', align_corners=False)  # (B, num_classes, H, W)
+        return logits
     def load_head_checkpoint(self, head: segheader.BNHead, backbone_name, head_dataset, head_type, DINOV2_BASE_URL):
         """
         fbaipublicfiles에서 헤드 체크포인트 다운로드 후 BNHead에 로드.
@@ -469,152 +291,3 @@ class DinoV2Encoder:
         if unexpected: print(f"[경고] Unexpected: {unexpected}")
         #print(f"헤드 로드 완료 ({len(head_state)} keys)")
 
-    def masked_average_pool(self,
-            feat_map: torch.Tensor,
-            mask_np: np.ndarray,
-    ) -> tuple:
-        """
-        Args:
-            feat_map : [H_p, W_p, OUT_DIM]  float32, on DEVICE
-            mask_np  : [H_orig, W_orig]     bool numpy array
-                       RF-DETR detections.mask[i] 원본 해상도 (480, 640)
-
-        Returns:
-            vec       : [OUT_DIM]  float32  (마스크가 빈 경우 zero vector)
-            n_patches : int        패치 그리드 상 마스크 면적 (품질 지표)
-
-        Note:
-            (480, 640) → (H_p, W_p) 단일 nearest 리사이즈.
-            중간 DINOv2 입력 크기(476, 630)를 거칠 필요 없음 — nearest는
-            단계를 합쳐도 결과가 동일하고 오히려 정확도 손실이 없음.
-        """
-        H_p, W_p, D = feat_map.shape
-
-        # (480, 640) bool numpy → float tensor [1, 1, 480, 640]
-        mask_t = torch.from_numpy(mask_np.astype(np.float32)).to(self.device)
-        mask_t = mask_t.unsqueeze(0).unsqueeze(0)
-
-        # 패치 그리드(H_p, W_p)로 직접 다운샘플 (nearest: 경계 보존)
-        mask_patch = F.interpolate(
-            mask_t, size=(H_p, W_p), mode="nearest"
-        ).squeeze()  # [H_p, W_p]
-
-        mask_bool = mask_patch > 0.5  # [H_p, W_p] bool
-        n_patches = int(mask_bool.sum().item())
-
-        if n_patches == 0:
-            return torch.zeros(D, device=self.device), 0
-
-        feat_flat = feat_map.reshape(-1, D)  # [H_p*W_p, D]
-        mask_flat = mask_bool.reshape(-1)  # [H_p*W_p]
-
-        vec = feat_flat[mask_flat].mean(dim=0)  # [D]
-        return vec, n_patches
-
-    def batch_masked_average_pool(self,
-                                  feat_map: torch.Tensor,
-                                  masks: np.ndarray,  # [K, H_orig, W_orig]
-                                  ) -> tuple:
-        """
-        Args:
-            feat_map : [1, D, H_p, W_p]   float32
-            masks    : [K, H_orig, W_orig] bool numpy or tensor
-        """
-        K = masks.shape[0]
-        _, D, H_p, W_p = feat_map.shape
-
-        # 1. K=0 예외 처리 (검출된 객체가 없을 때)
-        if K == 0:
-            return torch.empty((0, D), device=self.device), torch.zeros(0, device=self.device)
-
-        # 2. 마스크를 Tensor로 변환 및 [K, 1, H, W] 형태로 준비
-        if isinstance(masks, np.ndarray):
-            masks_t = torch.from_numpy(masks).to(self.device).float()
-        else:
-            masks_t = masks.to(self.device).float()
-
-        if masks_t.dim() == 3:
-            masks_t = masks_t.unsqueeze(1)
-
-        # 3. 보간법을 이용한 리사이즈 [K, 1, H_p, W_p]
-        # nearest 모드는 bool 성질을 가장 잘 유지함
-        masks_patch = F.interpolate(masks_t, size=(H_p, W_p), mode="nearest")
-        masks_bool = (masks_patch.squeeze(1) > 0.5).float()  # [K, H_p, W_p]
-
-        # 4. 각 마스크별 유효 패치 개수 계산 [K]
-        n_patches = masks_bool.sum(dim=(1, 2))
-
-        # 5. 행렬 곱셈을 이용한 고속 연산
-        # feat_flat: [D, H_p*W_p]
-        # masks_flat: [K, H_p*W_p]
-        feat_flat = feat_map.view(D, -1)
-        masks_flat = masks_bool.view(K, -1)
-
-        # [K, H_p*W_p] @ [H_p*W_p, D] -> [K, D]
-        sum_vecs = torch.mm(masks_flat, feat_flat.t())
-
-        # 6. 평균 계산 (n_patches가 0인 마스크는 0 벡터 반환)
-        denom = n_patches.unsqueeze(1)
-        vecs = torch.where(denom > 0, sum_vecs / denom, torch.zeros_like(sum_vecs))
-
-        return vecs, n_patches
-
-    # ── 시각화 ────────────────────────────────────────────────────────────────────
-    def visualize_segmentation(
-            self,
-            original_img: Image.Image,
-            seg_map: np.ndarray,  # (H, W) int — 클래스 인덱스
-            classes: list,
-            palette: np.ndarray,  # (N, 3) uint8
-            alpha: float = 0.55,
-            figsize: tuple = (20, 7),
-            output_path: str = None,
-    ):
-        """
-        3열 시각화: 원본 / 세그멘테이션 맵 / 오버레이 + 레전드
-
-        Args:
-            alpha      : 오버레이에서 세그멘테이션 비율 (0=원본, 1=세그맵)
-            output_path: 지정 시 파일 저장
-        """
-        colored = palette[seg_map]  # (H, W, 3)
-        orig_np = np.array(original_img, dtype=np.float32)
-        blended = ((1 - alpha) * orig_np + alpha * colored.astype(np.float32)) \
-            .clip(0, 255).astype(np.uint8)
-
-        present_ids = np.unique(seg_map)
-        legend = [
-            mpatches.Patch(
-                facecolor=palette[i] / 255.0,
-                edgecolor="white",
-                linewidth=0.5,
-                label=f"{i}: {classes[i]}" if i < len(classes) else f"class_{i}",
-            )
-            for i in present_ids if i < len(palette)
-        ]
-
-        fig, axes = plt.subplots(1, 3, figsize=figsize)
-        for ax, title, im in zip(
-                axes,
-                ["Original", "Segmentation Map", f"Overlay  α={alpha}"],
-                [np.array(original_img), colored, blended],
-        ):
-            ax.imshow(im)
-            ax.set_title(title, fontsize=13, fontweight="bold", pad=6)
-            ax.axis("off")
-
-        fig.legend(
-            handles=legend, loc="lower center",
-            ncol=min(len(legend), 7), fontsize=10,
-            bbox_to_anchor=(0.5, -0.06), frameon=True,
-            fancybox=True, framealpha=0.9,
-        )
-        plt.tight_layout()
-
-        if output_path:
-            plt.savefig(output_path, dpi=150, bbox_inches="tight")
-            print(f"저장: {output_path}")
-
-        plt.show()
-        print(f"검출 클래스 ({len(present_ids)}개): "
-              f"{[classes[i] for i in present_ids if i < len(classes)]}")
