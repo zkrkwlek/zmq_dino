@@ -208,6 +208,113 @@ class DinoV2Encoder:
 
         return x_cat, cls_attn
 
+    def extract_features_with_attention_and_k(
+            self,
+            x: torch.Tensor,
+            layer_idx: int = 11,  # ViT-Base 기준 마지막 블록 인덱스
+            patch_size: int = 14,
+            head_indices: list = [0,1,2,3,4,5]
+    ) -> tuple:
+        """
+        백본을 단 한 번만 포워드하여
+        1) 세그멘테이션용 Feature Map(x_cat)과
+        2) 해당 레이어의 CLS Attention, K 벡터를 한 번에 추출합니다.
+        Returns:
+            x_cat : (B, embed_dim, h_feat, w_feat) -> 후속 세그헤드 입력용
+            cls_attn : (B, N) -> 뭉친 패치 필터링 및 객체 앵커 선별용 (N = h_feat * w_feat)
+        """
+        B, C, H, W = x.shape
+        h_feat = H // patch_size
+        w_feat = W // patch_size
+        N_patch = h_feat*w_feat
+
+        num_heads = 6  # vits14 모델의 Attention Head 개수는 6개입니다.
+        dim = 384
+        head_dim = dim // num_heads
+
+        # 💡 1. 훅(Hook) 데이터 컨테이너 및 공유 훅 정의
+        attention_map = {}
+        hook_data = {}
+
+        def qkv_hook(module, inp, out):
+            # out shape: [B, N+1, 3 * embed_dim] -> [B, N+1, 1152]
+            # (N+1은 CLS 토큰 1개 + 패치 N개)
+            hook_data['qkv'] = out.detach()
+
+        # 💡 2. MemEffAttention 내부에 존재하는 실제 레이어인 'qkv'에 훅 등록
+        out_indices = [11]
+        attn_layer_idx = out_indices[-1]
+        target_block = self.model.blocks[attn_layer_idx]
+        handle = target_block.attn.qkv.register_forward_hook(qkv_hook)
+
+        # 💡 3. 순방향 연산 실행 (get_intermediate_layers 내부에서 훅이 트리거됨)
+        raw_features = self.model.get_intermediate_layers(
+            x,
+            n=out_indices,
+            reshape=False,
+            return_class_token=False,
+            norm=True,
+        )
+
+        # 훅 즉시 제거 (메모리 누수 방지 및 다음 프레임 오염 차단)
+        handle.remove()
+
+        # 💡 4. Feature Map 성형 [B, D, H_p, W_p]
+        feature_maps = []
+        for feat in raw_features:
+            feat = feat.reshape(B, h_feat, w_feat, -1).permute(0, 3, 1, 2).contiguous()
+            feature_maps.append(feat)
+        x_cat = torch.cat(feature_maps, dim=1)
+
+        #QKV 파싱
+        qkv = hook_data['qkv']  # [B, N+1, 1152]
+        total_tokens = qkv.shape[1]  # N+1
+
+        # [B, N+1, 3, num_heads, head_dim] 형태로 분할 후 Q, K, V 추출
+        qkv = qkv.reshape(B, total_tokens, 3, num_heads, head_dim)
+        q = qkv[:, :, 0]  # [B, N+1, num_heads, head_dim]
+        k = qkv[:, :, 1]  # [B, N+1, num_heads, head_dim]
+
+        # Scaled Dot-Product Attention 수학적 연산을 위해 축 변경 [B, num_heads, N+1, head_dim]
+        q = q.permute(0, 2, 1, 3)
+        k = k.permute(0, 2, 1, 3)
+
+        q = q[:, head_indices, :, :]
+        k = k[:, head_indices, :, :]
+
+        # 전역 어텐션 행렬 연산 수행 (Q @ K_T)
+        # [B, num_heads, N+1, head_dim] @ [B, num_heads, head_dim, N+1] -> [B, num_heads, N+1, N+1]
+        attn_scores = torch.matmul(q, k.transpose(-2, -1)) / np.sqrt(head_dim)
+        attn_weights = F.softmax(attn_scores, dim=-1)
+
+        # 💡 7. CLS 토큰(0번 행)이 나머지 패치(1번 열 이후)를 바라보는 지분만 슬라이싱
+        cls_attn = attn_weights[:, :, 0, 1:]  # [B, num_heads, num_patches]
+        cls_attn = cls_attn.mean(dim=1)
+
+
+        ##K의 어피니티를 활용. 아니면 K값만.
+        k_patches = k[:, :, 1:, :]
+        #k_patches = k_patches.transpose(1, 2).reshape(B, N_patch, 64*len(head_indices))
+        B, num_heads, N, head_dim = k_patches.shape
+        k_patches = k_patches.view(B, num_heads, h_feat, w_feat, head_dim)
+        k_patches = k_patches.permute(0, 2,3,1,4).contiguous()
+        k_patches = k_patches.view(B, h_feat, w_feat, num_heads*head_dim)
+        k_patches = k_patches.permute(0, 3, 1, 2).contiguous()
+
+        #print(k_patches.shape)
+        #k_patches = k_patches.view(N, D)
+
+        #k_patches_norm = F.normalize(k_patches, p=2, dim=-1)
+        #k_affinity_matrix = torch.matmul(k_patches_norm, k_patches_norm.transpose(-2, -1))
+
+        #features = x_cat[0].view(384, -1).t()  # [N, D]
+        #feat_last_64 = features[:, -64:]
+        #is_same = torch.allclose(feat_last_64, K_flat, atol=1e-6)
+        #print("test K = ", x_cat.shape,k_patches.shape, q.shape, cls_attn.shape)
+
+        return x_cat, cls_attn, k_patches
+
+
     def preprocess_cv2(self, img_rgb: np.ndarray, patch_size=14, target_size=None):
         H, W = img_rgb.shape[:2]
 
