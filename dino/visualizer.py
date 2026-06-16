@@ -220,6 +220,202 @@ class DinoPatchVisualizer:
 
         return distinct_colors
 
+    def visualize_exclusive_master_groups(self, img_bgr, sample1_new, exclusive_affinity_mn, grid_shape=(34, 45),
+                                          alpha=0.4):
+
+        H_img, W_img, _ = img_bgr.shape
+        H_p, W_p = grid_shape
+        M, N = exclusive_affinity_mn.shape  # M: 최종 정예 마스터 사물 수, N: 전체 패치 수 (1530)
+
+        if M == 0:
+            print("⚠️ [Visualizer] 시각화할 마스터 사물 그룹(M)이 0개입니다.")
+            cv2.imshow("Exclusive Master Object Map", img_bgr)
+            cv2.waitKey(1)
+            return img_bgr
+
+        # 1. 고유 마스터 사물 ID 기반 결정론적 색상 매핑 (클래스 내장 컬러 자산 풀 안전 활용)
+        color_map = {m_idx: self.colors[m_idx % len(self.colors)] for m_idx in range(M)}
+
+        # 2. 고해상도 채색 레이아웃 도화지 개설
+        mask_overlay = np.zeros_like(img_bgr, dtype=np.uint8)
+        affinity_np = exclusive_affinity_mn.cpu().numpy()
+        sample_new_np = sample1_new.cpu().numpy()
+
+        scale_y = H_img / H_p
+        scale_x = W_img / W_p
+        master_text_positions = []
+
+        # ====================================================================
+        # PHASE 1: [전역 배타적 영토 마스킹 채색 & 마스터 센트로이드 역산]
+        # ====================================================================
+        for m_idx in range(M):
+            color = color_map[m_idx]
+
+            # ① 👑 [진짜 마스터 시드 좌표 추출]: 새로 정렬된 sample1_new의 패치 주소 룩업
+            master_patch_idx = sample_new_np[m_idx]
+            m_y_p = master_patch_idx // W_p
+            m_x_p = master_patch_idx % W_p
+
+            # 1:1 순정 물리 픽셀 해상도 중심 좌표 산출
+            master_center_x = int((m_x_p + 0.5) * scale_x)
+            master_center_y = int((m_y_p + 0.5) * scale_y)
+            master_text_positions.append((master_center_x, master_center_y, m_idx, master_patch_idx))
+
+            # ② 👑 [독점 영토 복원]: argmax 제약을 뚫고 살아남은 배타적 자식 패치 인덱스 추출
+            member_patch_indices = np.where(affinity_np[m_idx] == True)[0]
+
+            for p_idx in member_patch_indices:
+                y_p = p_idx // W_p
+                x_p = p_idx % W_p
+
+                y_start, y_end = int(y_p * scale_y), int((y_p + 1) * scale_y)
+                x_start, x_end = int(x_p * scale_x), int((x_p + 1) * scale_x)
+
+                # 중복 없이 완벽하게 단 하나의 사물 고유 색상으로만 픽셀 영역 점유 보장
+                mask_overlay[y_start:y_end, x_start:x_end] = color
+
+        # 순정 이미지 위에 알파 블렌딩 합성 (배경 디테일 60%, 사물 영토 40%)
+        fused_img = cv2.addWeighted(img_bgr, 1.0 - alpha, mask_overlay, alpha, 0)
+
+        # ====================================================================
+        # PHASE 2: [마스터 노드 하이라이트 & 기하 사물 ID 자막 인쇄]
+        # ====================================================================
+        for s_x, s_y, m_id, p_idx in master_text_positions:
+            color = color_map[m_id]
+
+            # 마스터 앵커 노드에 특수 타겟 서클 마킹 (블랙 외곽선 가이드 포함으로 가독성 최적화)
+            cv2.circle(fused_img, (s_x, s_y), 6, (0, 0, 0), -1, cv2.LINE_AA)
+            cv2.circle(fused_img, (s_x, s_y), 4, color, -1, cv2.LINE_AA)
+            cv2.circle(fused_img, (s_x, s_y), 2, (255, 255, 255), -1, cv2.LINE_AA)
+
+            # 자막 레이아웃 포맷: "M:마스터그룹ID (P:대표패치번호)"
+            id_text = f"M:{m_id} (P:{p_idx})"
+
+            # 검은색 테두리 그림자 2중 투사
+            cv2.putText(fused_img, id_text, (s_x + 10, s_y + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 0, 0), 2,
+                        cv2.LINE_AA)
+            # 흰색 본문 글자
+            cv2.putText(fused_img, id_text, (s_x + 10, s_y + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1,
+                        cv2.LINE_AA)
+
+        # 시스템 모니터 전역 상태 바 인쇄
+        title_text = f"Fully Exclusive Master Object Map (Total Verified Entities: {M})"
+        cv2.putText(fused_img, title_text, (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 3, cv2.LINE_AA)
+        cv2.putText(fused_img, title_text, (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1, cv2.LINE_AA)
+
+        # 독립 전용 창 오픈 및 즉시 갱신
+        cv2.imshow("Exclusive_Master_Object_Map", fused_img)
+        cv2.waitKey(1)
+
+        return fused_img
+
+    def visualize_mixed_boundary_patches(self, img_bgr, I_n, grid_shape=(34, 45), overlap_counts=None, alpha=0.4):
+        """
+        Args:
+            img_bgr       : 원본 BGR 이미지 [H, W, 3]
+            I_n           : [N] 형태의 가림/경계면 지시 함수 텐서 또는 넘파이 배열 (1.0: 믹스, 0.0: 순수)
+            grid_shape    : (H_p, W_p) 형태의 격자 구조 (기본값: (34, 45))
+            overlap_counts: [N] 형태의 패치별 유효 매칭 객체 카운트 텐서/배열 (선택 사항)
+                            주입 시 중첩 개수별 그라데이션 채색 및 수치 인라인 오버레이 가동
+            alpha         : 블렌딩 투명도 (기본값: 0.4)
+        """
+        H_img, W_img, _ = img_bgr.shape
+        H_p, W_p = grid_shape
+
+        # 1. 텐서 안전 해제 및 1D -> 2D 격자 변환 ([1530] -> [34, 45])
+        if torch.is_tensor(I_n):
+            I_n_np = I_n.detach().cpu().numpy()
+        else:
+            I_n_np = np.array(I_n)
+        I_n_2d = I_n_np.reshape(H_p, W_p)
+
+        counts_2d = None
+        if overlap_counts is not None:
+            if torch.is_tensor(overlap_counts):
+                counts_np = overlap_counts.detach().cpu().numpy()
+            else:
+                counts_np = np.array(overlap_counts)
+            counts_2d = counts_np.reshape(H_p, W_p)
+
+        # 도화지 및 오버레이 레이어 생성
+        canvas_img = img_bgr.copy()
+        mask_overlay = np.zeros_like(img_bgr, dtype=np.uint8)
+
+        scale_y = H_img / H_p
+        scale_x = W_img / W_p
+
+        # ====================================================================
+        # PHASE 1: 경계면 믹스 패치 구역 정밀 타격 및 동적 컬러링
+        # ====================================================================
+        for y_p in range(H_p):
+            for x_p in range(W_p):
+                # 지시 플래그가 켜진(1.0) 믹스 패치 영역만 검출
+                if I_n_2d[y_p, x_p] > 0.5:
+                    y_start, y_end = int(y_p * scale_y), int((y_p + 1) * scale_y)
+                    x_start, x_end = int(x_p * scale_x), int((x_p + 1) * scale_x)
+
+                    # 👑 [박사님 핵심 의도 투사]: 겹침 개수에 따른 시각적 위험도 그라데이션 분배
+                    if counts_2d is not None:
+                        c_val = counts_2d[y_p, x_p]
+                        if c_val == 2:
+                            color = (0, 255, 255)  # 2개 중첩: Yellow (BGR)
+                        elif c_val == 3:
+                            color = (0, 140, 255)  # 3개 중첩: Orange (BGR)
+                        else:
+                            color = (0, 0, 255)  # 4개 이상 극심한 중첩: Red (BGR)
+                    else:
+                        color = (0, 0, 255)  # 카운트 미주입 시 기본 Red 채색
+
+                    # 격자 칸 닫기 플로팅
+                    cv2.rectangle(mask_overlay, (x_start, y_start), (x_end, y_end), color, -1)
+
+        # 원샷 알파 투명도 합성 기법으로 원본 이미지와 융합
+        fused_img = cv2.addWeighted(canvas_img, 1.0, mask_overlay, alpha, 0)
+
+        # ====================================================================
+        # PHASE 2: 격자 가이드망 및 중첩 수치(Digit) 선명화 오버레이
+        # ====================================================================
+        # 은은한 격자 가이드망 세공 (기하학적 바운더리 정합성 디버깅용)
+        grid_overlay = fused_img.copy()
+        for w_idx in range(1, W_p):
+            x_pos = int(w_idx * scale_x)
+            cv2.line(grid_overlay, (x_pos, 0), (x_pos, H_img), (200, 200, 200), 1, cv2.LINE_AA)
+        for h_idx in range(1, H_p):
+            y_pos = int(h_idx * scale_y)
+            cv2.line(grid_overlay, (0, y_pos), (W_img, y_pos), (200, 200, 200), 1, cv2.LINE_AA)
+        fused_img = cv2.addWeighted(fused_img, 0.88, grid_overlay, 0.12, 0)
+
+        # 투명도 연산으로 흐려지는 것을 방지하기 위해, 숫자는 알파 블렌딩 후 상공에 선명하게 각인
+        if counts_2d is not None:
+            for y_p in range(H_p):
+                for x_p in range(W_p):
+                    if I_n_2d[y_p, x_p] > 0.5:
+                        c_val = int(counts_2d[y_p, x_p])
+                        text_x = int((x_p + 0.25) * scale_x)
+                        text_y = int((y_p + 0.75) * scale_y)
+
+                        # 텍스트 검은색 그림자(Drop Shadow) 효과 처리로 시인성 300% 극대화
+                        cv2.putText(fused_img, str(c_val), (text_x + 1, text_y + 1), cv2.FONT_HERSHEY_SIMPLEX, 0.35,
+                                    (0, 0, 0), 2, cv2.LINE_AA)
+                        cv2.putText(fused_img, str(c_val), (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 0.35,
+                                    (255, 255, 255), 1, cv2.LINE_AA)
+
+        # ====================================================================
+        # PHASE 3: 마스터 시네마틱 디버깅 타이틀 바 융합
+        # ====================================================================
+        n_mixed = int((I_n_2d > 0.5).sum())
+        title_text = f"Multi-Response Patch Masking (Mixed Boundary Patches: {n_mixed} / {H_p * W_p})"
+
+        # 최상단 검은색 띠 배경 장착 및 폰트 투사
+        cv2.rectangle(fused_img, (0, 0), (W_img, 45), (0, 0, 0), -1)
+        cv2.putText(fused_img, title_text, (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2, cv2.LINE_AA)
+
+        # 실시간 윈도우 인퍼런스 화면 통제
+        cv2.imshow("Mixed Boundary Patch Masking Map", fused_img)
+        cv2.waitKey(1)
+
+        return fused_img
+
     def visualize_anchor_relations(self, img_bgr, centroids, inhibition_mask, anchor_links, grid_shape, alpha=0.4):
         H_img, W_img, _ = img_bgr.shape
         H_p, W_p = grid_shape
