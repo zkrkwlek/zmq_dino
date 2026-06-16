@@ -18,6 +18,39 @@ class DinoSemanticObjectExtractor:
         #features_norm = features[:,-64:]
         return features_norm, H_p, W_p
 
+    def detect_mixed_boundary_patches_by_counting(self, sim_matrix, th_sim=0.60, th_margin=0.12):
+        """
+        [진우 박사님 제안: 전수 마진 카운팅 기반 가림/경계면 패치 지시 함수 (\mathbb{I}_n) 구현]
+        규격: sim_matrix는 [K, N] 형태 (K: 사물 개수, N: 패치 개수 1530)
+        """
+        # Step 1. th_sim 보다 낮은 애들 0.0으로 만들기
+        sim_throttled = torch.where(sim_matrix >= th_sim, sim_matrix, torch.zeros_like(sim_matrix))
+
+        # Step 2. N 패치별(dim=0 방향)로 가장 큰 값을 고르기
+        # max_vals 크기: [1, N]
+        max_vals = sim_throttled.max(dim=0, keepdim=True).values
+
+        # Step 3. 각 원소별 마진 계산 (브로드캐스팅 감산)
+        # margins 크기: [K, N]
+        margins = max_vals - sim_throttled
+
+        # Step 4. 👑 [박사님 핵심 필터링 정렬]:
+        # 마진이 th_margin보다 "큰" 유령 성분들을 제외하고,
+        # 1등 스코어와 촘촘하게 겹쳐있는(margins < th_margin) 진짜 핵심 성분들만 유효 패치로 남깁니다.
+        # 유효 사물이 되려면 기본적으로 th_sim 가드(sim_throttled > 0)도 통과해야 합니다.
+        valid_overlap_mask = (sim_throttled > 0) & (margins < th_margin)  # [K, N] (Boolean)
+
+        # Step 5. 패치별(dim=0 세로 방향) 남는 사물 수를 카운트
+        # overlap_counts 크기: [N] (각 패치별로 매칭된 사물의 총 개수)
+        overlap_counts = valid_overlap_mask.sum(dim=0)
+
+        # Step 6. 👑 [최종 지시 함수 도출]:
+        # 해당 패치에 남은 유효 사물 수가 2개 이상이라는 것은 진짜 겹침/가림이 발생했다는 뜻입니다!
+        # I_n 크기: [N]
+        I_n = (overlap_counts >= 2).float()
+
+        return I_n, overlap_counts
+
     def compile_structural_equivalence_vectorized(self, feat_base, sample_avg_vecs, heatmap_threshold=0.85, sim_cutoff = 0.7):
         """
         [진우 박사님 전용 - 코사인 유사도 행렬 반환형 고속 위상 매칭 엔진]
@@ -52,6 +85,96 @@ class DinoSemanticObjectExtractor:
 
         # 💡 [정정 완공]: 시각화 레이어에서 직접 룩업할 수 있도록 유사도 매트릭스(heatmap_sim_np)를 함께 리턴!
         return group_assignments, n_components, heatmap_sim_np
+
+    #코드 확인이 필요함.
+    def extract_new_group_centroids_vectorized(self, sample1_old, group_assignments, n_components):
+        """
+        [진우 박사님 전용 - 마스터 시드 패치 추출 및 sample1 구조 동기화 엔진]
+
+        Args:
+            sample1_old      : [K] 기존 NMS 단계에서 선별되었던 정예 패치 1D Tensor (long)
+            group_assignments: compile_structural_equivalence_vectorized의 아웃풋인 그룹 ID 배열 [K] (Numpy)
+            n_components     : 최종 통합 분리된 총 그룹 개수 (M)
+
+        Returns:
+            sample1_new      : [M] 새로 합병된 그룹별 마스터 시드 패치 1D Tensor (long, GPU 유지 가능)
+                               기존 sample1과 완전히 동일한 데이터 파이프라인 규격을 가집니다.
+        """
+        device = sample1_old.device
+
+        # 1. 넘파이 group_assignments 주소를 파이토치 GPU 텐서로 즉시 변환
+        group_tensor = torch.from_numpy(group_assignments).long().to(device)  # [K]
+
+        # 2. 💡 [원핫 인코딩 선택 행렬 빌드]: 각 시드가 어떤 마스터 사물에 속하는지 매핑
+        # [K] -> [K, M] (0과 1로 구성)
+        selection_matrix = F.one_hot(group_tensor, num_classes=n_components)  # [K, M]
+
+        # 3. 👑 [대수적 대표 선별 기믹]: 각 마스터 사물 제국(M) 채널별로 최초로 소속된 원소 색출
+        # 열(dim=0) 방향으로 argmax를 취하면, 동일 그룹으로 묶인 기존 K개의 시드 중
+        # 인덱스가 가장 앞선(CLS 점수나 밀도가 가장 높았던) 기존 시드의 번호 [M]개가 루프 없이 가뿐하게 룩업됩니다.
+        master_k_indices = selection_matrix.argmax(dim=0)  # [M]
+
+        # 4. 🎯 [최종 sample1 구조화]: 기존 패치 번호판에서 마스터 주소들만 슬라이싱하여 복원
+        # 결과 형태: [M] 크기의 torch.Tensor (dtype=torch.long)
+        sample1_new = sample1_old[master_k_indices].long()
+
+        return sample1_new
+
+    def expand_patch_groups_exclusive_vectorized(self, feat_base, sample1_new, sim_thresh=0.70):
+        """
+        [진우 박사님 전용 - 마스터 시드 기반 전역 독점적 패치 그룹 확장 엔진]
+
+        하나의 패치가 가장 유사도가 높은 단 하나의 마스터 사물 그룹에만 독점적으로
+        귀속되도록 배타적(Exclusive) 매스킹을 0ms 만에 일괄 집행합니다.
+
+        Args:
+            feat_base     : [N, D] 이미지 전체 패치 피처 행렬 (정규화 전 원본 스케일 권장)
+            sample1_new   : [M] 앞서 합병 완공된 새로운 마스터 시드 1D 텐서 (dtype=torch.long)
+            sim_thresh    : 최소 소속 보증을 위한 하위 임계값 (이 값 미만은 배경으로 파기)
+
+        Returns:
+            exclusive_affinity_mn : [M, N] 하나의 패치가 단 하나의 마스터 그룹에만 True로 켜진 독점적 어피니티 마스크
+        """
+        device = feat_base.device
+        M = sample1_new.shape[0]
+        N = feat_base.shape[0]
+
+        if M == 0:
+            return torch.zeros((0, N), dtype=torch.bool, device=device)
+
+        # 1. 🛡️ 안전하게 L2 정규화 축 정렬
+        F_norm = feat_base
+        M_norm = F_norm[sample1_new.long()]
+        #F_norm = F.normalize(feat_base, p=2, dim=1)  # [N, D]
+        #M_norm = F_norm[sample1_new.long()]  # [M, D] 마스터 시드 피처 슬라이싱 추출
+
+        # 2. 🚀 [교차 유사도 행렬 생성]: 마스터 시드 [M, D] @ 전체 패치 [D, N]
+        # 결과 크기: [M, N]
+        cross_sim = torch.mm(M_norm, F_norm.t())  # [M, N]
+
+        # 3. 👑 [박사님 핵심 지시 - Exclusive 하드 컷오프 가드]:
+        # ① 전체 1530개 패치 각각에 대해 "나랑 가장 닮은 마스터 사물 인덱스"를 열(dim=0) 축 기준으로 단 한 방에 추출
+        best_master_indices = cross_sim.argmax(dim=0)  # [N] (각 패치가 귀속될 0 ~ M-1 사이의 마스터 ID)
+
+        # ② 임계값(sim_thresh)을 넘어서 최소한의 사물 정체성이 보장된 패치 필터링
+        # max(dim=0)을 통해 각 패치별 최대 유사도 값들을 확보합니다.
+        max_sim_values, _ = cross_sim.max(dim=0)  # [N]
+        valid_semantic_mask = max_sim_values >= sim_thresh  # [N] (Boolean)
+
+        # ③ 100% 벡터라이징 기반 독점적 불리언 맵 생성 [M, N]
+        # 0으로 채워진 빈 캔버스를 열고, 패치별로 가장 점수가 높았던 단 하나의 대장 행(Row) 주소에만 True를 마킹합니다.
+        exclusive_affinity_mn = torch.zeros((M, N), dtype=torch.bool, device=device)
+
+        # 유효한 시맨틱 임계값을 통과한 진짜 패치 노드들만 주소 추적
+        valid_patch_indices = torch.where(valid_semantic_mask)[0]
+        assigned_master_rows = best_master_indices[valid_patch_indices]
+
+        # 고급 인덱싱(Advanced Indexing)으로 루프 없이 단 한 클럭만에 독점 판 성형 종결
+        exclusive_affinity_mn[assigned_master_rows, valid_patch_indices] = True
+
+        return exclusive_affinity_mn
+
+    # deprecated
     def compile_structural_equivalence_vectorized2(self,feat_base, sample_avg_vecs, heatmap_threshold=0.85):
         """
         [진우 박사님 전용 - 중첩 루프를 전면 소거한 전역 히트맵 일치도 기반 고속 합병 커널]
@@ -96,6 +219,7 @@ class DinoSemanticObjectExtractor:
         print('cluster test', t4-t1, t2-t1,t3-t2,t4-t3)
         return group_assignments, heatmap_sim_np, n_components
 
+    #deprecated
     def build_anchor_to_patch_affinity_recursive(self, centroids, inhibition_mask, max_hops=1):
         """
         Args:
