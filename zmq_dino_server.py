@@ -76,6 +76,21 @@ def inference_loop(zmq_socket):
             kp1 = kp1.cuda()
             desc1 = desc1.cuda()
 
+            best_target = None
+            max_temporal_dist = -1
+            current_frame_idx = int(fid.decode())  # 현재 프레임 ID 정수화
+
+            for (tsrc, tfid) in list_neigh_frames:
+                target_frame_idx = int(tfid.decode())
+                temporal_dist = abs(current_frame_idx - target_frame_idx)
+
+                # 룩업 테이블이나 매니저를 통해 미리 계산된 SALAD 점수를 가져온다고 가정
+                # 만약 list_neigh_frames가 이미 SALAD 유사도 탑-N으로 정렬되어 들어온다면,
+                # 이 중에서 시간축 거리가 가장 먼 녀석을 고르는 것이 최선입니다.
+                if temporal_dist > max_temporal_dist and temporal_dist < 100:
+                    max_temporal_dist = temporal_dist
+                    best_target = (tsrc, tfid)
+
             t1 = time.time()
             ##DINOv2
             tensor1, (W, H) = model.preprocess_cv2(img_rgb1)
@@ -91,12 +106,23 @@ def inference_loop(zmq_socket):
             Np = H_p*W_p
             memory_bank_patches = torch.empty((Nm, 384), dtype=torch.float32, device=feat1.device)
             global_target_indices = []
+            start_idx = 0
             for i, (tsrc, tfid) in enumerate(selected_frames):
                 # 1) 현재 프레임의 DINO 패치 추출 (가상 텐서)
                 x_cat2, sample2, mask2, avg_patch_vec2, bind_xfeat_mat2 = map(
                     lambda x: x.cuda(), dino_mgr.get(tsrc, tfid)
                 )
                 feat2,_,_ = objpatcher._prepare_features(x_cat2)
+                M_new = avg_patch_vec2.shape[0]
+                end_idx = start_idx + M_new
+                memory_bank_patches[start_idx:end_idx, :] = avg_patch_vec2
+
+                if M_new > 0:
+                    adjusted_tensor = torch.arange(start_idx, start_idx+3, dtype=torch.long, device=avg_patch_vec2.device)
+                    global_target_indices.append(adjusted_tensor)
+
+                start_idx = end_idx
+                """
                 # 2) 텐서의 어느 위치에 넣을지 시작(start)과 끝(end) 인덱스 계산
                 start_idx = i * Np  # 0, 1024, 2048
                 end_idx = (i + 1) * Np  # 1024, 2048, 3072
@@ -107,7 +133,7 @@ def inference_loop(zmq_socket):
                 if sample2 is not None and len(sample2) > 0:
                     adjusted_tensor = sample2 + start_idx
                     global_target_indices.append(adjusted_tensor)
-
+                """
                 print(f"Frame {i}, {tfid.decode()} (인덱스 {start_idx}~{end_idx}) 채워넣기 완료")
 
             if len(list_neigh_frames) > 0:
@@ -115,7 +141,9 @@ def inference_loop(zmq_socket):
                     global_target_indices = torch.cat(global_target_indices, dim=0).to(feat1.device)
                 else:
                     global_target_indices = None
-                afeat1, aattn_1 = ca_mgr(feat1, memory_bank_patches, global_target_indices)
+                afeat1, aattn_1 = ca_mgr(feat1, avg_patch_vec2, None)
+                print("attn shape",aattn_1.shape, attn_1.shape)
+                visualizer.visualize_cls_attention_opencv(img1, aattn_1, grid_shape)
 
             grid_shape = (H_p, W_p)
             mask1, sim_mat1 = objpatcher.generate_mask(feat1, grid_shape, spatial_radius=3, sim_thresh=0.7)
@@ -126,12 +154,25 @@ def inference_loop(zmq_socket):
             # patch cluster
             group1, n_comp1, heat1 = objpatcher.compile_structural_equivalence_vectorized(feat1, avg_patch_vec1)
 
+            new_sample_1 = objpatcher.extract_new_group_centroids_vectorized(
+                sample1_old=sample1, group_assignments=group1, n_components=n_comp1
+            )
             #affinity11 = matcher.build_affinity_matrix(avg_patch_vec1, feat1)
+            new_affinity1 = objpatcher.expand_patch_groups_exclusive_vectorized(
+                feat_base=feat1,
+                sample1_new=new_sample_1,
+                sim_thresh=0.70  # 박사님의 순정 역치 유지
+            )
+            new_avg_patch_vec1, _ = objpatcher.extract_sample_neighborhood_average_pool(x_cat1, new_affinity1, attn_1)
 
-            link1 = objpatcher.build_anchor_to_anchor_link(affinity1)
+            sim1 = torch.matmul(new_avg_patch_vec1, feat1.t())
+            I1, overlap1 = objpatcher.detect_mixed_boundary_patches_by_counting(sim1)
+
+            link1 = objpatcher.build_anchor_to_anchor_link(new_affinity1)
             bind_xfeat_mat1 = dino_mgr.bind_xfeat_to_patch(kp1, grid_shape)
-            mat_sample_xfeat1 = torch.matmul(affinity1.float(), bind_xfeat_mat1)
-            dino_mgr.process(src, fid, (x_cat1.cpu(), sample1.cpu(), mask1.cpu(), avg_patch_vec1.cpu(), bind_xfeat_mat1.cpu()))
+            mat_sample_xfeat1 = torch.matmul(new_affinity1.float(), bind_xfeat_mat1)
+
+            dino_mgr.process(src, fid, (x_cat1.cpu(), new_sample_1.cpu(), mask1.cpu(), new_avg_patch_vec1.cpu(), bind_xfeat_mat1.cpu()))
             #patch_mask1 = objpatcher.build_patch_group_mask(feat1, sample1)
             #avg_vec1, n_patches1 = objpatcher.extract_sample_neighborhood_average_pool(x_cat1, sample1)
             #dino_mgr.process(src, fid, x_cat1.cpu(), sample1.cpu(), patch_mask1.cpu())
@@ -144,9 +185,11 @@ def inference_loop(zmq_socket):
             t4 = time.time()
 
             #visualizer.visualize_cls_attention_opencv(img1, attn_1, grid_shape)
-            visualizer.visualize_anchor_relations(img1, sample1, mask1, link1, grid_shape)
-            visualizer.visualize_sample_to_sample_similarity(img1, sample1, avg_patch_vec1, affinity1, grid_shape)
-            visualizer.visualize_new_structural_grouping(img1, sample1, affinity1, group1, heat1, n_comp1, grid_shape)
+            visualizer.visualize_exclusive_master_groups(img1, new_sample_1, new_affinity1, grid_shape)
+            visualizer.visualize_mixed_boundary_patches(img1, I1, grid_shape, overlap1)
+            #visualizer.visualize_anchor_relations(img1, new_sample_1, mask1, link1, grid_shape)
+            #visualizer.visualize_sample_to_sample_similarity(img1, new_sample_1, new_avg_patch_vec1, new_affinity1, grid_shape)
+            #visualizer.visualize_new_structural_grouping(img1, new_sample_1, new_affinity1, group1, heat1, n_comp1, grid_shape)
             #cv2.waitKey(0)
             #continue
 
@@ -175,20 +218,7 @@ def inference_loop(zmq_socket):
                 break
             """
             """"""
-            best_target = None
-            max_temporal_dist = -1
-            current_frame_idx = int(fid.decode())  # 현재 프레임 ID 정수화
 
-            for (tsrc, tfid) in list_neigh_frames:
-                target_frame_idx = int(tfid.decode())
-                temporal_dist = abs(current_frame_idx - target_frame_idx)
-
-                # 룩업 테이블이나 매니저를 통해 미리 계산된 SALAD 점수를 가져온다고 가정
-                # 만약 list_neigh_frames가 이미 SALAD 유사도 탑-N으로 정렬되어 들어온다면,
-                # 이 중에서 시간축 거리가 가장 먼 녀석을 고르는 것이 최선입니다.
-                if temporal_dist > max_temporal_dist and temporal_dist < 100:
-                    max_temporal_dist = temporal_dist
-                    best_target = (tsrc, tfid)
 
             if best_target is not None:
                 tsrc, tfid = best_target
@@ -207,7 +237,7 @@ def inference_loop(zmq_socket):
                 affinity2 = objpatcher.build_anchor_to_patch_affinity(sample2, mask2)
                 mat_sample_xfeat2 = torch.matmul(affinity2.float(), bind_xfeat_mat2)
 
-                smat = matcher.build_affinity_matrix(avg_patch_vec1, avg_patch_vec2)
+                smat = matcher.build_affinity_matrix(new_avg_patch_vec1, avg_patch_vec2)
                 fmat = matcher.build_affinity_matrix(desc1, desc2)
 
                 match_mask, match12 = matcher.compute_local_point_correspondence_batch_fixed(
@@ -223,8 +253,8 @@ def inference_loop(zmq_socket):
                     img1,  # Frame 1 이미지 변수
                     img2,  # Frame 2 이미지 변수
                     feat1,
-                    feat2, avg_patch_vec1,
-                    affinity1  # 기준 프레임 고유의 마스크 행렬
+                    feat2, new_avg_patch_vec1,
+                    new_affinity1  # 기준 프레임 고유의 마스크 행렬
                     #,sample1, group1,n_comp1
                 )
                 # C. 💡 [듀얼 시각화 가동]: 두 매칭 방식을 비교하여 "./matches/frame_XXXX.png" 로 저장
