@@ -220,6 +220,1054 @@ class DinoPatchVisualizer:
 
         return distinct_colors
 
+    """
+    [진우 박사님 전용 - 시드 패치 purity 인터랙티브 검증 뷰어]
+    dino/visualizer.py 의 DinoPatchVisualizer 클래스에 추가할 메서드.
+
+    기능:
+      - 이미지 위에 K개 시드 패치를 컬러 마커로 표시
+      - 시드 패치 클릭 → 해당 앵커의 vom / pure 패치를 좌우로 비교 표시
+        좌: vom  (마진 이내 전체 반응 패치)
+        우: pure (단독 점유 패치만)
+      - 클릭한 시드의 색상으로 패치 영역 하이라이트
+      - 타이틀에 앵커 인덱스, vom 면적, pure 면적 표시
+
+    호출 예시 (zmq_dino_server.py):
+        ctx = objpatcher.compute_anchor_patch_context(new_sample_1, feat1)
+        visualizer.visualize_seed_purity_interactive(
+            img1, ctx['centroids'], ctx['vom'], ctx['pure'], grid_shape
+        )
+    """
+
+    # ============================================================
+    #  NEW METHOD. save_anchor_overlaps_batch
+    # ============================================================
+    def save_anchor_overlaps_batch(
+            self,
+            base_output_dir,
+            frame_id,
+            img_bgr,
+            centroids,  # [K] long 앵커 시드 패치 인덱스
+            valid_overlap_mask,  # [K, N] bool compute_patch_purity_masks의 VOM
+            overlap_results,  # classify_anchor_overlaps_vectorized 의 반환 딕셔너리
+            grid_shape=(34, 45),
+            alpha=0.5
+    ):
+        """
+        [진우 박사님 전용 - 폴더 생성부터 50개 앵커 전수 배칭 저장까지 올인원 완결형 커널]
+
+        서버단에서 호출 시, 지정된 마스터 폴더 하위에 프레임 독립 서브 디렉터리를 구성하고
+        타 사물과 중복 관계(완전/부분)가 감지되는 모든 앵커의 대조 분석 지도를 자동 파일화합니다.
+        """
+        import os
+        import cv2
+        import torch
+
+        # ── STEP 1. 프레임 ID 파싱 및 독립 하위 디렉터리 동적 성형 ───────
+        fid_str = frame_id.decode() if isinstance(frame_id, bytes) else str(frame_id)
+        frame_output_dir = os.path.join(base_output_dir, f"frame_{fid_str}")
+        os.makedirs(frame_output_dir, exist_ok=True)
+
+        H_img, W_img = img_bgr.shape[:2]
+        H_p, W_p = grid_shape
+        N = H_p * W_p
+
+        # ── STEP 2. CUDA 텐서 안전 해제 및 넘파이 복사 ──────────────────
+        comp_r_t, comp_c_t = overlap_results['complete_pairs']
+        comp_r = comp_r_t.detach().cpu().numpy().astype(np.int64)
+        comp_c = comp_c_t.detach().cpu().numpy().astype(np.int64)
+
+        part_r_t, part_c_t = overlap_results['partial_pairs']
+        part_r = part_r_t.detach().cpu().numpy().astype(np.int64)
+        part_c = part_c_t.detach().cpu().numpy().astype(np.int64)
+
+        cent_np = centroids.detach().cpu().numpy().astype(np.int64)
+        vom_np = valid_overlap_mask.detach().cpu().numpy().astype(bool)
+        iou_mat = overlap_results['iou_matrix'].detach().cpu().numpy().astype(np.float32)
+        ovl_mat = overlap_results['overlap_matrix'].detach().cpu().numpy().astype(np.float32)
+        K = len(cent_np)
+
+        if K == 0:
+            return
+
+        scale_y = H_img / H_p
+        scale_x = W_img / W_p
+        offset = int(min(scale_y, scale_x) * 0.5)
+        colors = self.colors
+
+        comp_pairs = set(zip(comp_r.tolist(), comp_c.tolist()))
+        part_pairs = set(zip(part_r.tolist(), part_c.tolist()))
+
+        # ── 헬퍼 렌더러: 정예 노드 플로팅 구역 ──────────────────────────
+        def draw_nodes(canvas, selected_k):
+            for k in range(K):
+                n = int(cent_np[k])
+                y_p, x_p = divmod(n, W_p)
+                cx = int(x_p * scale_x + offset)
+                cy = int(y_p * scale_y + offset)
+                color = colors[k % len(colors)]
+                if k == selected_k:
+                    cv2.circle(canvas, (cx, cy), 9, (255, 255, 255), -1, cv2.LINE_AA)
+                    cv2.circle(canvas, (cx, cy), 7, color, -1, cv2.LINE_AA)
+                    cv2.circle(canvas, (cx, cy), 9, (0, 255, 0), 2, cv2.LINE_AA)
+                else:
+                    cv2.circle(canvas, (cx, cy), 6, (0, 0, 0), -1, cv2.LINE_AA)
+                    cv2.circle(canvas, (cx, cy), 5, color, -1, cv2.LINE_AA)
+                cv2.putText(canvas, str(k), (cx + 7, cy - 3), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 0, 0), 2, cv2.LINE_AA)
+                cv2.putText(canvas, str(k), (cx + 7, cy - 3), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1,
+                            cv2.LINE_AA)
+
+        # ── STEP 3. 최대 50개 등 전수 앵커 루프 시퀀스 집행 ─────────────
+        for selected_k in range(K):
+            color_k = colors[selected_k % len(colors)]
+            mask_k = vom_np[selected_k]
+
+            # 파트너 노드 가림 위상 관계 정밀 분류
+            twins = []
+            partials = []
+            for j in range(K):
+                if j == selected_k: continue
+                pair = (min(selected_k, j), max(selected_k, j))
+                if pair in comp_pairs:
+                    twins.append(j)
+                elif pair in part_pairs:
+                    partials.append(j)
+
+            # 💡 [박사님 전산 가드]: 중복 에지가 전혀 없는 깨끗한 사물 노드는 불필요한 I/O 방지를 위해 저장 스킵
+            if len(twins) == 0 and len(partials) == 0:
+                continue
+
+            # 🖼️ [LEFT CANVAS] - Twin / Subsumption
+            left = img_bgr.copy()
+            overlay_l = np.zeros_like(left)
+            for n in np.where(mask_k)[0]:
+                y_p, x_p = divmod(int(n), W_p)
+                overlay_l[int(y_p * scale_y):int((y_p + 1) * scale_y),
+                int(x_p * scale_x):int((x_p + 1) * scale_x)] = color_k
+            left = cv2.addWeighted(left, 1.0 - alpha, overlay_l, alpha, 0)
+
+            cx_k, cy_k = divmod(int(cent_np[selected_k]), W_p)
+            px_k, py_k = int(cy_k * scale_x + offset), int(cx_k * scale_y + offset)
+
+            for t_idx in twins:
+                cx_t, cy_t = divmod(int(cent_np[t_idx]), W_p)
+                px_t, py_t = int(cy_t * scale_x + offset), int(cx_t * scale_y + offset)
+                cv2.line(left, (px_k, py_k), (px_t, py_t), (255, 255, 0), 2, cv2.LINE_AA)
+                txt = f"Twin (IoU:{iou_mat[selected_k, t_idx]:.2f})"
+                cv2.putText(left, txt, ((px_k + px_t) // 2, (py_k + py_t) // 2 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.35,
+                            (0, 0, 0), 2, cv2.LINE_AA)
+                cv2.putText(left, txt, ((px_k + px_t) // 2, (py_k + py_t) // 2 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.35,
+                            (255, 180, 0), 1, cv2.LINE_AA)
+            draw_nodes(left, selected_k)
+
+            # 🖼️ [RIGHT CANVAS] - Boundary Sharing Intersection
+            right = img_bgr.copy()
+            overlay_r = np.zeros_like(right)
+            for p_idx in partials:
+                inter_mask = mask_k & vom_np[p_idx]
+                for n in np.where(inter_mask)[0]:
+                    y_p, x_p = divmod(int(n), W_p)
+                    overlay_r[int(y_p * scale_y):int((y_p + 1) * scale_y),
+                    int(x_p * scale_x):int((x_p + 1) * scale_x)] = (0, 0, 255)
+            right = cv2.addWeighted(right, 1.0 - alpha * 0.7, overlay_r, alpha * 0.7, 0)
+
+            for p_idx in partials:
+                cx_p, cy_p = divmod(int(cent_np[p_idx]), W_p)
+                px_p, py_p = int(cy_p * scale_x + offset), int(cx_p * scale_y + offset)
+                cv2.line(right, (px_k, py_k), (px_p, py_p), (0, 140, 255), 1, cv2.LINE_AA)
+                lbl = f"IoU:{iou_mat[selected_k, p_idx]:.2f} | O:{ovl_mat[selected_k, p_idx]:.2f}/{ovl_mat[p_idx, selected_k]:.2f}"
+                cv2.putText(right, lbl, (px_p + 8, py_p + 14), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 0, 0), 2,
+                            cv2.LINE_AA)
+                cv2.putText(right, lbl, (px_p + 8, py_p + 14), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (100, 255, 100), 1,
+                            cv2.LINE_AA)
+            draw_nodes(right, selected_k)
+
+            # ── 타이틀 바 자막 임베딩 ──────────────────────────────────
+            title_l = f"TWIN CAPTURE | Anchor k={selected_k} | Twins Count: {len(twins)}"
+            title_r = f"BOUNDARY SHARING | Intersection Red Area | Partials Count: {len(partials)}"
+            for canvas, title in [(left, title_l), (right, title_r)]:
+                cv2.rectangle(canvas, (0, 0), (W_img, 38), (0, 0, 0), -1)
+                cv2.putText(canvas, title, (15, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (200, 255, 200), 1, cv2.LINE_AA)
+
+            divider = np.full((H_img, 3, 3), 180, dtype=np.uint8)
+            master_canvas = np.hstack([left, divider, right])
+
+            # 서브디렉터리 내에 앵커별 넘버링 포맷 라이팅 집행
+            save_filename = os.path.join(frame_output_dir, f"anchor_{selected_k:03d}_overlap_report.png")
+            cv2.imwrite(save_filename, master_canvas)
+
+    # ============================================================
+    #  NEW METHOD. visualize_anchor_overlaps_interactive
+    # ============================================================
+    def visualize_anchor_overlaps_interactive(
+            self,
+            img_bgr,
+            centroids,  # [K] long  앵커 시드 패치 인덱스
+            valid_overlap_mask,  # [K, N] bool compute_patch_purity_masks의 VOM
+            overlap_results,  # classify_anchor_overlaps_vectorized 의 반환 딕셔너리
+            grid_shape=(34, 45),
+            alpha=0.5,
+            window_name="Anchor Overlap Classifier Inspector [Click Seed]"
+    ):
+        """
+        [진우 박사님 전용 - 앵커 간 완전/부분 중복 관계 인터랙티브 대조 뷰어]
+
+        좌측 화면: 선택한 앵커의 영토 분포 + 완전 중복(Twin / 부모-자식 종속) 관계 에지 링크
+        우측 화면: 선택한 앵커와 경쟁 사물 간의 실제 교집합(Intersection) 환부 격자 + 부분 중복 계수 투사
+        """
+        H_img, W_img = img_bgr.shape[:2]
+        H_p, W_p = grid_shape
+        N = H_p * W_p
+
+        # ── 텐서 안전 해제 및 넘파이 캐싱 ──────────────────────────────
+        def to_np(t, dtype):
+            if torch.is_tensor(t):
+                return t.detach().cpu().numpy().astype(dtype)
+            return np.asarray(t, dtype=dtype)
+
+        cent_np = to_np(centroids, np.int64)
+        vom_np = to_np(valid_overlap_mask, bool)
+        iou_mat = to_np(overlap_results['iou_matrix'], np.float32)
+        ovl_mat = to_np(overlap_results['overlap_matrix'], np.float32)
+        K = len(cent_np)
+
+        # 박사님 시스템 고유 스케일 상수 동기화
+        scale_y = H_img / H_p
+        scale_x = W_img / W_p
+        offset = int(min(scale_y, scale_x) * 0.5)
+        colors = self.colors
+
+        # ── 전역 상삼각 쌍둥이 주소록 파싱 및 룩업 딕셔너리 빌드 ───────
+        comp_r_t, comp_c_t = overlap_results['complete_pairs']
+        comp_r = comp_r_t.detach().cpu().numpy().astype(np.int64)
+        comp_c = comp_c_t.detach().cpu().numpy().astype(np.int64)
+
+        part_r_t, part_c_t = overlap_results['partial_pairs']
+        part_r = part_r_t.detach().cpu().numpy().astype(np.int64)
+        part_c = part_c_t.detach().cpu().numpy().astype(np.int64)
+
+        comp_pairs = set(zip(comp_r.tolist(), comp_c.tolist()))
+        part_pairs = set(zip(part_r.tolist(), part_c.tolist()))
+
+        # ── 기본 시드 노드 기하 구조 렌더링 함수 ───────────────────────
+        def draw_seed_nodes(canvas, selected_k=-1):
+            for k in range(K):
+                n = int(cent_np[k])
+                y_p, x_p = divmod(n, W_p)
+                cx = int(x_p * scale_x + offset)
+                cy = int(y_p * scale_y + offset)
+                color = colors[k % len(colors)]
+
+                if k == selected_k:
+                    cv2.circle(canvas, (cx, cy), 9, (255, 255, 255), -1, cv2.LINE_AA)
+                    cv2.circle(canvas, (cx, cy), 7, color, -1, cv2.LINE_AA)
+                    cv2.circle(canvas, (cx, cy), 9, (0, 255, 0), 2, cv2.LINE_AA)  # 타겟 하이라이트 에지
+                else:
+                    cv2.circle(canvas, (cx, cy), 6, (0, 0, 0), -1, cv2.LINE_AA)
+                    cv2.circle(canvas, (cx, cy), 5, color, -1, cv2.LINE_AA)
+
+                # 앵커 ID 인라인 인쇄 (2중 그림자 기믹)
+                cv2.putText(canvas, str(k), (cx + 7, cy - 3), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 0, 0), 2, cv2.LINE_AA)
+                cv2.putText(canvas, str(k), (cx + 7, cy - 3), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1,
+                            cv2.LINE_AA)
+
+        # ── 미선택 상태 초기 디폴트 도화지 성형 ────────────────────────
+        def make_default_canvas():
+            base = img_bgr.copy()
+            draw_seed_nodes(base, selected_k=-1)
+
+            # 우측은 대기 화면 처리
+            right_blank = np.zeros_like(base)
+            cv2.putText(right_blank, "Click a Seed Node on the Left to Inspect Overlaps",
+                        (W_img // 2 - 210, H_img // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (120, 120, 120), 1, cv2.LINE_AA)
+
+            # 최상단 대기 모드 헤더바 장착
+            cv2.rectangle(base, (0, 0), (W_img, 38), (0, 0, 0), -1)
+            cv2.putText(base, f"Total Isolated Anchors: {K} | Waiting for User Node Selection...", (15, 25),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 255, 255), 1, cv2.LINE_AA)
+
+            divider = np.full((H_img, 3, 3), 100, dtype=np.uint8)
+            return np.hstack([base, divider, right_blank])
+
+        # ── 👑 핵심 분기: 특정 앵커 클릭 시 실시간 대수 구조 투사 ───────
+        def make_active_canvas(selected_k):
+            color_k = colors[selected_k % len(colors)]
+            mask_k = vom_np[selected_k]  # [N] bool
+
+            # 파트너 노드 군집 분류 역산
+            twins = []
+            partials = []
+            for j in range(K):
+                if j == selected_k: continue
+                pair = (min(selected_k, j), max(selected_k, j))
+                if pair in comp_pairs:
+                    twins.append(j)
+                elif pair in part_pairs:
+                    partials.append(j)
+
+            # ----------------------------------------------------------------
+            # [LEFT CANVAS] - Twin & Subsumption Matrix Inspector
+            # ----------------------------------------------------------------
+            left = img_bgr.copy()
+            overlay_l = np.zeros_like(left)
+
+            # 내 영토 기본 도포 (고유 컬러)
+            for n in np.where(mask_k)[0]:
+                y_p, x_p = divmod(int(n), W_p)
+                overlay_l[int(y_p * scale_y):int((y_p + 1) * scale_y),
+                int(x_p * scale_x):int((x_p + 1) * scale_x)] = color_k
+            left = cv2.addWeighted(left, 1.0 - alpha, overlay_l, alpha, 0)
+
+            # 내 시드 중심 좌표 확보
+            cx_k, cy_k = divmod(int(cent_np[selected_k]), W_p)
+            px_k = int(cy_k * scale_x + offset)
+            py_k = int(cx_k * scale_y + offset)
+
+            # 쌍둥이 결속 실선 연결 및 수치화
+            for t_idx in twins:
+                cx_t, cy_t = divmod(int(cent_np[t_idx]), W_p)
+                px_t = int(cy_t * scale_x + offset)
+                py_t = int(cx_t * scale_y + offset)
+
+                # 완전 중복선은 두터운 네온 블루 라인 투사
+                cv2.line(left, (px_k, py_k), (px_t, py_t), (255, 255, 0), 2, cv2.LINE_AA)
+
+                # 텍스트 오버레이 (대칭 IoU 기준값 표기)
+                txt = f"Twin (IoU:{iou_mat[selected_k, t_idx]:.2f})"
+                cv2.putText(left, txt, ((px_k + px_t) // 2, (py_k + py_t) // 2 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.35,
+                            (0, 0, 0), 2, cv2.LINE_AA)
+                cv2.putText(left, txt, ((px_k + px_t) // 2, (py_k + py_t) // 2 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.35,
+                            (255, 180, 0), 1, cv2.LINE_AA)
+
+            draw_seed_nodes(left, selected_k)
+
+            # ----------------------------------------------------------------
+            # [RIGHT CANVAS] - Boundary Sharing & Intersection Overlap Inspector
+            # ----------------------------------------------------------------
+            right = img_bgr.copy()
+            overlay_r = np.zeros_like(right)
+
+            # 타겟 앵커와 부분 중복 관계를 가진 애들의 '교집합 환부 격자(Intersection Patches)'만 붉게 소생
+            for p_idx in partials:
+                inter_mask = mask_k & vom_np[p_idx]  # 대수학적 교집합 면적 추출
+                for n in np.where(inter_mask)[0]:
+                    y_p, x_p = divmod(int(n), W_p)
+                    overlay_r[int(y_p * scale_y):int((y_p + 1) * scale_y),
+                    int(x_p * scale_x):int((x_p + 1) * scale_x)] = (0, 0, 255)  # 경계면 Red 경고등
+            right = cv2.addWeighted(right, 1.0 - alpha * 0.7, overlay_r, alpha * 0.7, 0)
+
+            # 부분 중복 앵커 기하선 및 비대칭 지분율 정보 인쇄
+            for p_idx in partials:
+                cx_p, cy_p = divmod(int(cent_np[p_idx]), W_p)
+                px_p = int(cy_p * scale_x + offset)
+                py_p = int(cx_p * scale_y + offset)
+
+                # 부분 중복선은 주황색 점선/에지 투사
+                cv2.line(right, (px_k, py_k), (px_p, py_p), (0, 140, 255), 1, cv2.LINE_AA)
+
+                # 👑 [박사님 피드백 핵심 구현]: Symmetric IoU값과 더불어 비대칭 상호 지분율(i->j, j->i) 동시 대조
+                # 포맷: IoU | O_ij(내 전체 중 j가 먹은 비율) / O_ji(j 전체 중 내가 먹은 비율)
+                lbl = f"IoU:{iou_mat[selected_k, p_idx]:.2f} | O:{ovl_mat[selected_k, p_idx]:.2f}/{ovl_mat[p_idx, selected_k]:.2f}"
+                cv2.putText(right, lbl, (px_p + 8, py_p + 14), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 0, 0), 2,
+                            cv2.LINE_AA)
+                cv2.putText(right, lbl, (px_p + 8, py_p + 14), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (100, 255, 100), 1,
+                            cv2.LINE_AA)
+
+            draw_seed_nodes(right, selected_k)
+
+            # ── 상단 텍스트 바 자막 주입 ──────────────────────────────
+            title_l = f"TWIN CAPTURE | Anchor k={selected_k} | Complete Duplicates Count: {len(twins)}"
+            title_r = f"BOUNDARY SHARING | Intersection Red Area | Partial Overlaps Count: {len(partials)}"
+
+            for canvas, title in [(left, title_l), (right, title_r)]:
+                cv2.rectangle(canvas, (0, 0), (W_img, 38), (0, 0, 0), -1)
+                cv2.putText(canvas, title, (15, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (200, 255, 200), 1, cv2.LINE_AA)
+
+            divider = np.full((H_img, 3, 3), 180, dtype=np.uint8)
+            return np.hstack([left, divider, right])
+
+        # ── 마우스 인터랙션 통제 가드 ────────────────────────────────
+        state = {'canvas': make_default_canvas(), 'selected_k': -1}
+
+        def find_nearest_seed(px_x, px_y):
+            best_k = -1
+            best_dist = float('inf')
+            radius = int(min(scale_y, scale_x) * 2.5)  # 클릭 유효 스캔 반경
+
+            for k in range(K):
+                n = int(cent_np[k])
+                y_p, x_p = divmod(n, W_p)
+                cx = int(x_p * scale_x + offset)
+                cy = int(y_p * scale_y + offset)
+                dist = (px_x - cx) ** 2 + (px_y - cy) ** 2
+                if dist < best_dist and dist < radius ** 2:
+                    best_dist = dist
+                    best_k = k
+            return best_k
+
+        def on_mouse(event, x, y, flags, param):
+            if event != cv2.EVENT_LBUTTONDOWN: return
+            if x >= W_img: return  # 좌측 컨트롤 프레임 클릭만 추적
+
+            k = find_nearest_seed(x, y)
+            if k < 0: return
+
+            state['selected_k'] = k
+            state['canvas'] = make_active_canvas(k)
+            cv2.imshow(window_name, state['canvas'])
+
+        # ── 윈도우 가동 제어 엔진 ─────────────────────────────────────
+        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(window_name, W_img * 2 + 3, H_img)
+        cv2.setMouseCallback(window_name, on_mouse)
+        cv2.imshow(window_name, state['canvas'])
+        cv2.waitKey(1)
+
+        return state['canvas']
+    def visualize_seed_purity_interactive2(
+            self,
+            img_bgr,
+            centroids,  # [K] long  시드 패치 인덱스
+            vom,  # [K, N] bool  XFeat 귀속용 전체 반응
+            pure,  # [K, N] bool  단독 점유 패치
+            grid_shape=(34, 45),
+            alpha=0.5,
+            window_name="Seed Purity Viewer [click seed to inspect]",
+    ):
+        """
+        시드 패치를 클릭하면 해당 앵커의 vom / pure 패치를 좌우로 비교 시각화.
+
+        좌: vom  — 마진 이내 전체 반응 패치 (XFeat 귀속용)
+        우: pure — 단독 점유 패치만        (avg_vec 계산용)
+
+        색상:
+          선택된 앵커의 vom  → 해당 앵커 고유 컬러
+          선택된 앵커의 pure → 밝은 초록 (0, 255, 100)
+          vom에는 있지만 pure에 없는 패치 (overlap) → 빨강 (0, 0, 200)
+          시드 마커 → 고유 컬러 원 (전체), 선택된 시드 → 흰 테두리 강조
+        """
+        H_img, W_img = img_bgr.shape[:2]
+        H_p, W_p = grid_shape
+        N = H_p * W_p
+
+        # ── numpy 변환 ───────────────────────────────────────────────
+        def to_np(t, dtype):
+            if torch.is_tensor(t):
+                return t.detach().cpu().numpy().astype(dtype)
+            return np.asarray(t, dtype=dtype)
+
+        cent_np = to_np(centroids, np.int64)  # [K]
+        vom_np = to_np(vom, bool)  # [K, N]
+        pure_np = to_np(pure, bool)  # [K, N]
+        K = len(cent_np)
+
+        scale_y = H_img / H_p
+        scale_x = W_img / W_p
+        offset = int(min(scale_y, scale_x) * 0.5)
+        colors = self.colors
+
+        # ── 시드 마커 베이스 이미지 생성 ────────────────────────────
+        def make_seed_base(selected_k=-1):
+            """모든 시드 마커를 이미지 위에 그린 베이스 캔버스 반환"""
+            base = img_bgr.copy()
+            for k in range(K):
+                n = int(cent_np[k])
+                y_p, x_p = divmod(n, W_p)
+                cx = int(x_p * scale_x + offset)
+                cy = int(y_p * scale_y + offset)
+                color = colors[k % len(colors)]
+
+                if k == selected_k:
+                    # 선택된 시드: 큰 원 + 흰 테두리 강조
+                    cv2.circle(base, (cx, cy), 9, (255, 255, 255), -1, cv2.LINE_AA)
+                    cv2.circle(base, (cx, cy), 7, color, -1, cv2.LINE_AA)
+                    cv2.circle(base, (cx, cy), 9, (255, 255, 255), 2, cv2.LINE_AA)
+                else:
+                    cv2.circle(base, (cx, cy), 6, (0, 0, 0), -1, cv2.LINE_AA)
+                    cv2.circle(base, (cx, cy), 5, color, -1, cv2.LINE_AA)
+
+                # 앵커 인덱스 텍스트
+                cv2.putText(base, str(k), (cx + 7, cy - 3),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.35,
+                            (0, 0, 0), 2, cv2.LINE_AA)
+                cv2.putText(base, str(k), (cx + 7, cy - 3),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.35,
+                            (255, 255, 255), 1, cv2.LINE_AA)
+            return base
+
+        # ── 패치 오버레이 렌더링 ─────────────────────────────────────
+        def render_patch_overlay(mask_n, patch_color, base):
+            """mask_n [N] bool 기반 패치 오버레이를 base 위에 블렌딩"""
+            overlay = np.zeros_like(base, dtype=np.uint8)
+            indices = np.where(mask_n)[0]
+            for n in indices:
+                y_p, x_p = divmod(int(n), W_p)
+                y0 = int(y_p * scale_y);
+                y1_ = int((y_p + 1) * scale_y)
+                x0 = int(x_p * scale_x);
+                x1_ = int((x_p + 1) * scale_x)
+                overlay[y0:y1_, x0:x1_] = patch_color
+            return cv2.addWeighted(base, 1.0 - alpha, overlay, alpha, 0)
+
+        # ── 선택 앵커 캔버스 생성 ────────────────────────────────────
+        def make_canvas(selected_k):
+            color_k = colors[selected_k % len(colors)]
+            vom_mask = vom_np[selected_k]  # [N] bool
+            pure_mask = pure_np[selected_k]  # [N] bool
+            # overlap = vom에는 있지만 pure에 없는 패치
+            overlap_mask = vom_mask & ~pure_mask  # [N] bool
+
+            # ── 좌: vom 전체 ─────────────────────────────────────────
+            seed_base_l = make_seed_base(selected_k)
+            left = render_patch_overlay(vom_mask, color_k, seed_base_l)
+
+            # vom 위에 overlap 구간 빨강으로 재표시
+            ovl_overlay = np.zeros_like(left, dtype=np.uint8)
+            for n in np.where(overlap_mask)[0]:
+                y_p, x_p = divmod(int(n), W_p)
+                y0 = int(y_p * scale_y);
+                y1_ = int((y_p + 1) * scale_y)
+                x0 = int(x_p * scale_x);
+                x1_ = int((x_p + 1) * scale_x)
+                ovl_overlay[y0:y1_, x0:x1_] = (0, 0, 200)
+            left = cv2.addWeighted(left, 1.0, ovl_overlay, alpha, 0)
+
+            # ── 우: pure + overlap 앵커 귀속 ────────────────────────────
+            # pure 패치  → 선택 앵커 고유 컬러
+            # overlap 패치 → 겹치는 다른 앵커들의 컬러로 표시
+            #               (여러 앵커가 겹치면 가장 낮은 인덱스 앵커 컬러 우선)
+            seed_base_r = make_seed_base(selected_k)
+            right = seed_base_r.copy()
+
+            right_overlay = np.zeros_like(right, dtype=np.uint8)
+
+            # 1. pure 패치: 선택 앵커 컬러
+            for n in np.where(pure_mask)[0]:
+                y_p, x_p = divmod(int(n), W_p)
+                y0 = int(y_p * scale_y);
+                y1_ = int((y_p + 1) * scale_y)
+                x0 = int(x_p * scale_x);
+                x1_ = int((x_p + 1) * scale_x)
+                right_overlay[y0:y1_, x0:x1_] = color_k
+
+            # 2. overlap 패치: 경쟁 앵커들의 컬러
+            #    vom_np[:, n] 에서 selected_k 제외하고 True인 앵커들 색상 혼합
+            competing_anchors_per_patch = {}  # n → [k1, k2, ...]
+            for n in np.where(overlap_mask)[0]:
+                competitors = [k for k in range(K)
+                               if k != selected_k and vom_np[k, n]]
+                competing_anchors_per_patch[n] = competitors
+
+            for n, competitors in competing_anchors_per_patch.items():
+                if not competitors:
+                    continue
+                y_p, x_p = divmod(int(n), W_p)
+                y0 = int(y_p * scale_y);
+                y1_ = int((y_p + 1) * scale_y)
+                x0 = int(x_p * scale_x);
+                x1_ = int((x_p + 1) * scale_x)
+
+                # 경쟁 앵커 컬러 평균 (여러 앵커가 겹치는 경우)
+                mixed = np.mean(
+                    [colors[k % len(colors)] for k in competitors], axis=0
+                ).astype(np.uint8)
+                right_overlay[y0:y1_, x0:x1_] = mixed
+
+                # 경쟁 앵커 인덱스 텍스트 (패치 중앙에 표시)
+                cx_p = int(x0 + (x1_ - x0) * 0.5)
+                cy_p = int(y0 + (y1_ - y0) * 0.5)
+                label = ",".join(str(k) for k in competitors)
+                cv2.putText(right, label, (cx_p - 4, cy_p + 4),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.28,
+                            (0, 0, 0), 2, cv2.LINE_AA)
+                cv2.putText(right, label, (cx_p - 4, cy_p + 4),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.28,
+                            (255, 255, 255), 1, cv2.LINE_AA)
+
+            right = cv2.addWeighted(right, 1.0 - alpha, right_overlay, alpha, 0)
+
+            # ── 타이틀 ───────────────────────────────────────────────
+            vom_area = int(vom_mask.sum())
+            pure_area = int(pure_mask.sum())
+            ovl_area = int(overlap_mask.sum())
+            n_unique_competitors = len(set(
+                k for comps in competing_anchors_per_patch.values() for k in comps
+            ))
+
+            title_l = (f"k={selected_k}  VOM (total={vom_area})  "
+                       f"| anchor_color=vom  red=overlap({ovl_area})")
+            title_r = (f"k={selected_k}  PURE={pure_area}  OVERLAP={ovl_area}  "
+                       f"competing anchors={n_unique_competitors}  "
+                       f"| anchor_color=pure  mixed_color=competitor")
+
+            for canvas, title in [(left, title_l), (right, title_r)]:
+                cv2.rectangle(canvas, (0, 0), (W_img, 38), (0, 0, 0), -1)
+                cv2.putText(canvas, title, (10, 26),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.50,
+                            (200, 255, 200), 1, cv2.LINE_AA)
+
+            # ── 구분선 ───────────────────────────────────────────────
+            divider = np.full((H_img, 3, 3), 180, dtype=np.uint8)
+            return np.hstack([left, divider, right])
+
+        # ── 초기 캔버스: 시드만 표시, 미선택 상태 ────────────────────
+        def make_default_canvas():
+            base = make_seed_base(selected_k=-1)
+            # 전체 vom 합집합을 옅게 표시
+            any_vom = vom_np.any(axis=0)  # [N]
+            any_pure = pure_np.any(axis=0)  # [N]
+
+            overlay = np.zeros_like(base, dtype=np.uint8)
+            for n in range(N):
+                if any_vom[n]:
+                    y_p, x_p = divmod(n, W_p)
+                    y0 = int(y_p * scale_y);
+                    y1_ = int((y_p + 1) * scale_y)
+                    x0 = int(x_p * scale_x);
+                    x1_ = int((x_p + 1) * scale_x)
+                    color = (0, 200, 0) if any_pure[n] else (0, 0, 180)
+                    overlay[y0:y1_, x0:x1_] = color
+
+            blended = cv2.addWeighted(base, 1.0 - alpha * 0.4,
+                                      overlay, alpha * 0.4, 0)
+
+            # 범례 및 안내
+            title = (f"K={K} anchors  |  Click a seed to inspect  "
+                     f"|  green=pure  red=overlap")
+            cv2.rectangle(blended, (0, 0), (W_img * 2 + 3, 38), (0, 0, 0), -1)
+            cv2.putText(blended, title, (10, 26),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.50,
+                        (200, 255, 200), 1, cv2.LINE_AA)
+
+            # 우측 절반은 빈 캔버스
+            right_blank = np.zeros_like(base)
+            cv2.putText(right_blank,
+                        "Click a seed patch on the left",
+                        (W_img // 2 - 120, H_img // 2),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                        (100, 100, 100), 1, cv2.LINE_AA)
+            divider = np.full((H_img, 3, 3), 180, dtype=np.uint8)
+            return np.hstack([blended, divider, right_blank])
+
+        # ── 상태 ────────────────────────────────────────────────────
+        state = {'canvas': make_default_canvas(), 'selected_k': -1}
+
+        # ── 시드 클릭 판정 ──────────────────────────────────────────
+        def find_nearest_seed(px_x, px_y):
+            """클릭 픽셀 좌표에서 가장 가까운 시드 인덱스 반환 (탐색 반경 내)"""
+            best_k = -1
+            best_dist = float('inf')
+            radius = int(min(scale_y, scale_x) * 2.5)  # 시드 탐색 반경
+
+            for k in range(K):
+                n = int(cent_np[k])
+                y_p, x_p = divmod(n, W_p)
+                cx = int(x_p * scale_x + offset)
+                cy = int(y_p * scale_y + offset)
+                dist = (px_x - cx) ** 2 + (px_y - cy) ** 2
+                if dist < best_dist and dist < radius ** 2:
+                    best_dist = dist
+                    best_k = k
+            return best_k
+
+        # ── 마우스 콜백 ─────────────────────────────────────────────
+        def on_mouse(event, x, y, flags, param):
+            if event != cv2.EVENT_LBUTTONDOWN:
+                return
+
+            # 좌측 이미지 영역만 클릭 인식 (우측은 W_img + 3 이후)
+            if x >= W_img:
+                return
+
+            k = find_nearest_seed(x, y)
+            if k < 0:
+                return
+
+            state['selected_k'] = k
+            state['canvas'] = make_canvas(k)
+            cv2.imshow(window_name, state['canvas'])
+
+        # ── 윈도우 실행 ─────────────────────────────────────────────
+        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(window_name, W_img * 2 + 3, H_img)
+        cv2.setMouseCallback(window_name, on_mouse)
+        cv2.imshow(window_name, state['canvas'])
+        cv2.waitKey(1)
+
+        # ※ 블로킹 루프는 호출자(zmq_dino_server.py)에서 관리.
+        #   이 함수는 waitKey(1) 로 즉시 반환하며,
+        #   메인 루프의 waitKey에서 마우스 이벤트가 처리됨.
+        return state['canvas']
+    # ============================================================
+    #  V1. visualize_pure_vs_overlap_patches
+    # ============================================================
+    def visualize_pure_vs_overlap_patches(
+            self,
+            img_bgr,
+            valid_overlap_mask,  # [K, N] bool  — XFeat 귀속용 전체 반응 마스크
+            pure_affinity,  # [K, N] bool  — avg_vec 계산용 순수 패치 마스크
+            grid_shape=(34, 45),
+            alpha=0.5,
+            window_name="Pure vs Overlap Patches",
+    ):
+        """
+        패치별 순수/경계/미반응 유형을 색으로 구분하여 시각화.
+        valid_overlap_mask 와 pure_affinity 의 차이를 직관적으로 확인하는 용도.
+
+        색상 범례:
+          초록(0,200,0)   : 순수 패치 — 단 하나의 앵커만 점유 (pure_affinity 에 포함)
+          빨강(0,0,220)   : 경계 패치 — 둘 이상의 앵커가 경쟁 (valid_overlap_mask 에만 포함)
+          어두운 배경     : 어떤 앵커도 반응하지 않은 미반응 패치
+        """
+        H_img, W_img = img_bgr.shape[:2]
+        H_p, W_p = grid_shape
+        N = H_p * W_p
+
+        # ── 텐서 → numpy 변환 ──────────────────────────────────────
+        def to_np_bool(t):
+            if torch.is_tensor(t):
+                return t.detach().cpu().bool().numpy()
+            return np.asarray(t, dtype=bool)
+
+        vom_np = to_np_bool(valid_overlap_mask)  # [K, N]
+        pure_np = to_np_bool(pure_affinity)  # [K, N]
+
+        # ── 패치별 분류 ─────────────────────────────────────────────
+        # 어느 앵커라도 반응한 패치
+        any_response = vom_np.any(axis=0)  # [N]
+        # 단독 점유 패치 (pure)
+        is_pure = pure_np.any(axis=0)  # [N]
+        # 경계 패치 = 반응은 있지만 순수하지 않음
+        is_overlap = any_response & ~is_pure  # [N]
+
+        # ── 오버레이 레이어 생성 ─────────────────────────────────────
+        scale_y = H_img / H_p
+        scale_x = W_img / W_p
+
+        overlay = np.zeros_like(img_bgr, dtype=np.uint8)
+
+        for n in range(N):
+            y_p, x_p = divmod(n, W_p)
+            y0, y1_ = int(y_p * scale_y), int((y_p + 1) * scale_y)
+            x0, x1_ = int(x_p * scale_x), int((x_p + 1) * scale_x)
+
+            if is_pure[n]:
+                overlay[y0:y1_, x0:x1_] = (0, 200, 0)  # 초록 — 순수
+            elif is_overlap[n]:
+                overlay[y0:y1_, x0:x1_] = (0, 0, 220)  # 빨강 — 경계
+
+        # ── 블렌딩 ──────────────────────────────────────────────────
+        # 미반응 구역은 원본 이미지를 어둡게 처리하여 구분감 강화
+        dark_bg = (img_bgr * 0.35).astype(np.uint8)
+        response_mask_2d = any_response.reshape(H_p, W_p)
+        response_full = cv2.resize(
+            response_mask_2d.astype(np.uint8) * 255,
+            (W_img, H_img), interpolation=cv2.INTER_NEAREST
+        ).astype(bool)
+
+        canvas = np.where(response_full[:, :, None], img_bgr, dark_bg)
+        canvas = cv2.addWeighted(canvas, 1.0 - alpha, overlay, alpha, 0)
+
+        # ── 통계 텍스트 ─────────────────────────────────────────────
+        n_pure = int(is_pure.sum())
+        n_overlap = int(is_overlap.sum())
+        n_none = N - int(any_response.sum())
+
+        title = (f"Pure={n_pure}  Overlap={n_overlap}  No-response={n_none}  "
+                 f"| Total patches={N}")
+        cv2.rectangle(canvas, (0, 0), (W_img, 38), (0, 0, 0), -1)
+        cv2.putText(canvas, title, (10, 26),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.52, (200, 255, 200), 1, cv2.LINE_AA)
+
+        # ── 범례 ────────────────────────────────────────────────────
+        legend_items = [
+            ("Pure (single anchor)", (0, 200, 0)),
+            ("Overlap (multi anchor)", (0, 0, 220)),
+            ("No response", (80, 80, 80)),
+        ]
+        lx, ly = 10, H_img - 20
+        for label, color in reversed(legend_items):
+            cv2.rectangle(canvas, (lx, ly - 12), (lx + 14, ly + 2), color, -1)
+            cv2.putText(canvas, label, (lx + 18, ly),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, (230, 230, 230), 1, cv2.LINE_AA)
+            ly -= 22
+
+        cv2.imshow(window_name, canvas)
+        cv2.waitKey(1)
+        return canvas
+
+    # ============================================================
+    #  V2. visualize_anchor_refinement_comparison
+    # ============================================================
+    def visualize_anchor_refinement_comparison(
+            self,
+            img_bgr,
+            centroids,  # [K] long  — 정제 대상 앵커 시드 인덱스
+            valid_overlap_mask,  # [K, N] bool  — 정제 전 (XFeat용 전체 반응)
+            refined_masks,  # [K, N] bool  — 정제 후 (pure 기반 + 병합)
+            valid_after,  # [K] bool  — 면적 필터 통과 여부
+            grid_shape=(34, 45),
+            alpha=0.45,
+            window_name="Anchor Refinement: Before vs After",
+    ):
+        """
+        정제 전(valid_overlap_mask) vs 정제 후(refined_masks) 좌우 비교 시각화.
+        앵커별 컬러는 동일하게 유지하며, 각 앵커의 면적 변화와 병합 여부를 텍스트로 표시.
+
+        좌: 정제 전 — valid_overlap_mask 기반 그룹
+        우: 정제 후 — refined_masks 기반 그룹 (면적 필터 탈락 앵커는 X 표시)
+        """
+        H_img, W_img = img_bgr.shape[:2]
+        H_p, W_p = grid_shape
+        N = H_p * W_p
+
+        # ── 텐서 → numpy ────────────────────────────────────────────
+        def to_np(t, dtype=bool):
+            if torch.is_tensor(t):
+                return t.detach().cpu().numpy().astype(dtype)
+            return np.asarray(t, dtype=dtype)
+
+        vom_np = to_np(valid_overlap_mask)  # [K, N]
+        ref_np = to_np(refined_masks)  # [K, N]
+        valid_np = to_np(valid_after)  # [K]
+        cent_np = to_np(centroids, dtype=np.int64)  # [K]
+        K = vom_np.shape[0]
+
+        scale_y = H_img / H_p
+        scale_x = W_img / W_p
+        offset = int(min(scale_y, scale_x) * 0.5)
+
+        # 앵커별 고유 컬러 (좌우 동일)
+        colors = self.colors
+
+        def draw_anchor_map(mask_kn, title_str):
+            """mask_kn [K, N] 기반 오버레이 생성"""
+            base = img_bgr.copy()
+            overlay = np.zeros_like(base)
+
+            for k in range(K):
+                color = colors[k % len(colors)]
+                patches = np.where(mask_kn[k])[0]
+                for n in patches:
+                    y_p, x_p = divmod(int(n), W_p)
+                    y0 = int(y_p * scale_y);
+                    y1_ = int((y_p + 1) * scale_y)
+                    x0 = int(x_p * scale_x);
+                    x1_ = int((x_p + 1) * scale_x)
+                    overlay[y0:y1_, x0:x1_] = color
+
+            blended = cv2.addWeighted(base, 1.0 - alpha, overlay, alpha, 0)
+
+            # 앵커 시드 마커 및 면적 텍스트
+            for k in range(K):
+                n = int(cent_np[k])
+                y_p, x_p = divmod(n, W_p)
+                cx = int(x_p * scale_x + offset)
+                cy = int(y_p * scale_y + offset)
+                color = colors[k % len(colors)]
+                area = int(mask_kn[k].sum())
+
+                cv2.circle(blended, (cx, cy), 5, color, -1, cv2.LINE_AA)
+                cv2.circle(blended, (cx, cy), 5, (255, 255, 255), 1, cv2.LINE_AA)
+                cv2.putText(blended, str(area), (cx + 6, cy - 4),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 0, 0), 2, cv2.LINE_AA)
+                cv2.putText(blended, str(area), (cx + 6, cy - 4),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.38, (255, 255, 255), 1, cv2.LINE_AA)
+
+            cv2.rectangle(blended, (0, 0), (W_img, 36), (0, 0, 0), -1)
+            cv2.putText(blended, title_str, (10, 24),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.54, (0, 255, 255), 1, cv2.LINE_AA)
+            return blended
+
+        # ── 좌: 정제 전 ─────────────────────────────────────────────
+        n_anchors_before = K
+        canvas_before = draw_anchor_map(
+            vom_np,
+            f"BEFORE  | Anchors={n_anchors_before}"
+        )
+
+        # ── 우: 정제 후 ─────────────────────────────────────────────
+        canvas_after = draw_anchor_map(
+            ref_np,
+            f"AFTER   | Anchors surviving={int(valid_np.sum())} / {K}"
+        )
+
+        # 면적 필터 탈락 앵커에 X 표시
+        for k in range(K):
+            if not valid_np[k]:
+                n = int(cent_np[k])
+                y_p, x_p = divmod(n, W_p)
+                cx = int(x_p * scale_x + offset)
+                cy = int(y_p * scale_y + offset)
+                cv2.drawMarker(canvas_after, (cx, cy), (0, 0, 255),
+                               cv2.MARKER_TILTED_CROSS, 14, 2, cv2.LINE_AA)
+
+        # 병합 탐지: refined_masks 가 pure_affinity 보다 넓어진 앵커 → 병합 발생
+        # (refined_masks 면적 > valid_overlap_mask 면적의 경우는 병합이 아니므로
+        #  pure 기준으로 비교: vom_np.sum(axis=1) 대비 ref_np.sum(axis=1) 변화량)
+        area_before = vom_np.sum(axis=1).astype(int)  # [K]
+        area_after = ref_np.sum(axis=1).astype(int)  # [K]
+        for k in range(K):
+            if not valid_np[k]:
+                continue
+            n = int(cent_np[k])
+            y_p, x_p = divmod(n, W_p)
+            cx = int(x_p * scale_x + offset)
+            cy = int(y_p * scale_y + offset)
+            delta = area_after[k] - area_before[k]
+            if delta != 0:
+                sign = "+" if delta > 0 else ""
+                label = f"Δ{sign}{delta}"
+                cv2.putText(canvas_after, label, (cx + 6, cy + 14),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.36, (0, 220, 255), 1, cv2.LINE_AA)
+
+        # ── 좌우 결합 ───────────────────────────────────────────────
+        divider = np.full((H_img, 3, 3), 200, dtype=np.uint8)
+        canvas = np.hstack([canvas_before, divider, canvas_after])
+
+        cv2.imshow(window_name, canvas)
+        cv2.waitKey(1)
+        return canvas
+
+    # ============================================================
+    #  V3. visualize_seed_filter_result
+    # ============================================================
+    def visualize_seed_filter_result(
+            self,
+            img_bgr,
+            centroids,  # [K_all] long  — 필터 적용 전 전체 앵커 시드
+            overlap_counts,  # [N]           — 패치별 경쟁 앵커 수
+            valid_seed_mask,  # [K_all] bool  — True=생존, False=배제
+            grid_shape=(34, 45),
+            alpha=0.35,
+            window_name="Seed Filter Result",
+    ):
+        """
+        filter_seed_overlap_anchors 결과 시각화.
+
+        생존 앵커 : 고유 컬러 원형 마커 + 시드 패치 컬러 오버레이
+        배제 앵커 : 빨간 X 마커 + 시드 패치 위치에 반투명 빨강 오버레이
+                   + 배제 이유 텍스트 (seed overlap count=N)
+        배경      : overlap_counts 기반 경계 패치 위치를 옅은 노랑으로 표시
+        """
+        H_img, W_img = img_bgr.shape[:2]
+        H_p, W_p = grid_shape
+        N = H_p * W_p
+
+        # ── 텐서 → numpy ────────────────────────────────────────────
+        def to_np(t, dtype):
+            if torch.is_tensor(t):
+                return t.detach().cpu().numpy().astype(dtype)
+            return np.asarray(t, dtype=dtype)
+
+        cent_np = to_np(centroids, np.int64)  # [K_all]
+        oc_np = to_np(overlap_counts, np.float32)  # [N]
+        valid_np = to_np(valid_seed_mask, bool)  # [K_all]
+        K_all = len(cent_np)
+
+        scale_y = H_img / H_p
+        scale_x = W_img / W_p
+        offset = int(min(scale_y, scale_x) * 0.5)
+
+        canvas = img_bgr.copy()
+        overlay = np.zeros_like(canvas, dtype=np.uint8)
+
+        # ── 배경: overlap 패치를 옅은 노랑으로 표시 ─────────────────
+        for n in range(N):
+            if oc_np[n] >= 2:
+                y_p, x_p = divmod(n, W_p)
+                y0 = int(y_p * scale_y);
+                y1_ = int((y_p + 1) * scale_y)
+                x0 = int(x_p * scale_x);
+                x1_ = int((x_p + 1) * scale_x)
+                overlay[y0:y1_, x0:x1_] = (0, 200, 220)  # 옅은 노랑 (BGR)
+
+        canvas = cv2.addWeighted(canvas, 1.0 - alpha * 0.5, overlay, alpha * 0.5, 0)
+
+        colors = self.colors
+
+        # ── 생존 앵커 ───────────────────────────────────────────────
+        for k in range(K_all):
+            if not valid_np[k]:
+                continue
+            n = int(cent_np[k])
+            y_p, x_p = divmod(n, W_p)
+            cx = int(x_p * scale_x + offset)
+            cy = int(y_p * scale_y + offset)
+            color = colors[k % len(colors)]
+
+            # 시드 패치 컬러 오버레이
+            y0 = int(y_p * scale_y);
+            y1_ = int((y_p + 1) * scale_y)
+            x0 = int(x_p * scale_x);
+            x1_ = int((x_p + 1) * scale_x)
+            cv2.rectangle(canvas, (x0, y0), (x1_, y1_), color, -1)
+
+            # 원형 마커
+            cv2.circle(canvas, (cx, cy), 6, color, -1, cv2.LINE_AA)
+            cv2.circle(canvas, (cx, cy), 6, (255, 255, 255), 1, cv2.LINE_AA)
+
+            # 앵커 인덱스 텍스트
+            cv2.putText(canvas, str(k), (cx + 7, cy - 3),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.36, (0, 0, 0), 2, cv2.LINE_AA)
+            cv2.putText(canvas, str(k), (cx + 7, cy - 3),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.36, (255, 255, 255), 1, cv2.LINE_AA)
+
+        # ── 배제 앵커 ───────────────────────────────────────────────
+        for k in range(K_all):
+            if valid_np[k]:
+                continue
+            n = int(cent_np[k])
+            y_p, x_p = divmod(n, W_p)
+            cx = int(x_p * scale_x + offset)
+            cy = int(y_p * scale_y + offset)
+
+            # 시드 패치 위치 빨강 오버레이
+            y0 = int(y_p * scale_y);
+            y1_ = int((y_p + 1) * scale_y)
+            x0 = int(x_p * scale_x);
+            x1_ = int((x_p + 1) * scale_x)
+            cv2.rectangle(canvas, (x0, y0), (x1_, y1_), (40, 40, 200), -1)
+
+            # X 마커
+            cv2.drawMarker(canvas, (cx, cy), (0, 0, 255),
+                           cv2.MARKER_TILTED_CROSS, 16, 2, cv2.LINE_AA)
+
+            # 배제 이유 텍스트: seed overlap count
+            seed_oc = int(oc_np[n])
+            reason = f"k{k} oc={seed_oc}"
+            cv2.putText(canvas, reason, (cx + 8, cy + 4),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.36, (0, 0, 0), 2, cv2.LINE_AA)
+            cv2.putText(canvas, reason, (cx + 8, cy + 4),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.36, (80, 80, 255), 1, cv2.LINE_AA)
+
+        # ── 타이틀 바 ───────────────────────────────────────────────
+        n_survive = int(valid_np.sum())
+        n_exclude = K_all - n_survive
+        title = (f"Seed Filter  |  Survived={n_survive}  Excluded={n_exclude}  "
+                 f"Total={K_all}  |  Yellow=overlap patches")
+        cv2.rectangle(canvas, (0, 0), (W_img, 38), (0, 0, 0), -1)
+        cv2.putText(canvas, title, (10, 26),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.50, (200, 255, 200), 1, cv2.LINE_AA)
+
+        # ── 범례 ────────────────────────────────────────────────────
+        legend = [
+            ("Survived anchor", (0, 200, 0)),
+            ("Excluded anchor (seed in overlap)", (0, 0, 200)),
+            ("Overlap patch (oc>=2)", (0, 200, 220)),
+        ]
+        lx, ly = 10, H_img - 16
+        for label, color in reversed(legend):
+            cv2.rectangle(canvas, (lx, ly - 12), (lx + 14, ly + 2), color, -1)
+            cv2.putText(canvas, label, (lx + 18, ly),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.40, (230, 230, 230), 1, cv2.LINE_AA)
+            ly -= 20
+
+        cv2.imshow(window_name, canvas)
+        cv2.waitKey(1)
+        return canvas
+    ###공유 패치 검증
+
     def visualize_exclusive_master_groups(self, img_bgr, sample1_new, exclusive_affinity_mn, grid_shape=(34, 45),
                                           alpha=0.4):
 

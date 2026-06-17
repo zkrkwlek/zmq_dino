@@ -18,6 +18,1014 @@ class DinoSemanticObjectExtractor:
         #features_norm = features[:,-64:]
         return features_norm, H_p, W_p
 
+    ###수정3
+    """
+    [진우 박사님 전용 - 마진 카운팅 기반 앵커 정제 모듈 v3]
+    dino/patchcluster.py 의 DinoSemanticObjectExtractor 클래스에 추가할 메서드들.
+
+    설계 원칙:
+      - avg_vec 사용 안 함. 시드 패치 피처를 직접 슬라이싱하여 sim_matrix 계산.
+      - 전처리(compute_anchor_patch_context)를 한 번만 실행 후 결과 재사용.
+      - 병합 방식 A/B를 독립 함수로 분리하여 비교 실험 가능.
+      - 공통 후처리(group_pure는 그룹 간 경쟁 기준으로 재계산)를 공유.
+
+    함수 목록:
+      1. compute_anchor_patch_context  : 시드 기반 전처리 (vom, pure, oc, H_matrix, heatmap_sim)
+      2. _apply_group_and_recompute    : 공통 후처리 (group_pure 재계산 + avg_vec)
+      3. merge_anchors_heatmap         : 병합 방식 A — 히트맵 분포 유사도
+      4. merge_anchors_shared_patch    : 병합 방식 B — 공유 패치 비율 + 시드 포함
+      5. filter_memory_anchors_cross_frame : 다중 프레임 배제
+
+    사용 예시 (zmq_dino_server.py):
+      ctx = objpatcher.compute_anchor_patch_context(new_sample_1, feat1)
+
+      # A/B 중 하나 또는 둘 다 실행하여 비교
+      result_a = objpatcher.merge_anchors_heatmap(ctx, feat1)
+      result_b = objpatcher.merge_anchors_shared_patch(ctx, feat1)
+
+      valid_mem, _ = objpatcher.filter_memory_anchors_cross_frame(
+          result_a['avg_vec'], feat2)
+    """
+
+    # ============================================================
+    #  SHARED: 공통 후처리
+    # ============================================================
+    def _apply_group_and_recompute(self, vom, pure, feat, group_assign_np, device):
+        """
+        connected_components 결과를 받아 공통 후처리 수행.
+
+        1. one_hot → group_vom, group_pure_raw 합집합
+        2. group_pure 재계산: 그룹 간 경쟁 기준
+           (그룹 내부 앵커끼리 겹치는 패치는 pure로 인정,
+            다른 그룹과 겹치는 패치만 overlap으로 처리)
+        3. avg_vec 재계산: group_pure 기반
+
+        Args:
+            vom           : [K, N] bool
+            pure          : [K, N] bool  (앵커 단위 pure, 참고용)
+            feat          : [N, D] float
+            group_assign_np: [K]   numpy int
+            device        : torch.device
+
+        Returns:
+            dict:
+              group_vom     [G, N] bool  XFeat 귀속용
+              group_pure    [G, N] bool  그룹 간 경쟁 기준 pure
+              avg_vec       [G, D] float L2 정규화 완료
+              valid_groups  [G]   bool   순수 패치 >= min_area
+              group_assign  [K]   long
+        """
+        K, N = vom.shape
+        D = feat.shape[1]
+        n_groups = int(group_assign_np.max()) + 1
+
+        group_assign_t = torch.tensor(
+            group_assign_np, dtype=torch.long, device=device
+        )  # [K]
+
+        vom_f = vom.float()  # [K, N]
+
+        # ── STEP 1. one_hot → group_vom 합집합 ─────────────────────
+        one_hot = F.one_hot(group_assign_t,
+                            num_classes=n_groups).float()  # [K, G]
+        group_vom_f = torch.mm(one_hot.t(), vom_f)  # [G, N]
+        group_vom = group_vom_f > 0  # [G, N] bool
+
+        # ── STEP 2. group_pure 재계산 (그룹 간 경쟁 기준) ────────────
+        # 패치 n을 점유하는 그룹 수
+        group_oc = group_vom_f.clamp(max=1.0).sum(dim=0)  # [N]
+        # 단 하나의 그룹만 점유하는 패치 = group pure
+        group_pure = group_vom & (group_oc == 1).unsqueeze(0)  # [G, N] bool
+
+        # ── STEP 3. avg_vec 재계산 ──────────────────────────────────
+        # group_pure 충분 → group_pure 기반
+        # group_pure 부족 → group_vom fallback
+        pure_area = group_pure.float().sum(dim=1)  # [G]
+        vom_area = group_vom.float().sum(dim=1)  # [G]
+
+        use_pure = (pure_area >= 2).unsqueeze(1).expand(n_groups, N)  # [G, N]
+        eff_mask = torch.where(use_pure,
+                               group_pure.float(),
+                               group_vom.float())  # [G, N]
+
+        feature_sums = torch.mm(eff_mask, feat)  # [G, D]
+        patch_counts = eff_mask.sum(dim=1, keepdim=True).clamp(min=1.0)
+        avg_vec = F.normalize(feature_sums / patch_counts,
+                              p=2, dim=1)  # [G, D]
+
+        # ── STEP 4. valid_groups ────────────────────────────────────
+        valid_groups = vom_area >= 1  # [G] bool
+
+        return dict(
+            group_vom=group_vom,
+            group_pure=group_pure,
+            avg_vec=avg_vec,
+            valid_groups=valid_groups,
+            group_assign=group_assign_t,
+        )
+
+    # ============================================================
+    #  METHOD 1. compute_anchor_patch_context
+    # ============================================================
+    def compute_anchor_patch_context(
+            self,
+            centroids,  # [K] long   앵커 시드 패치 인덱스
+            feat,  # [N, D] float  L2 정규화 완료
+            th_sim=0.60,
+            th_margin=0.12,
+            sim_cutoff=0.60,  # 히트맵 클리핑 임계값
+    ):
+        """
+        시드 패치 피처를 직접 슬라이싱하여 전처리 컨텍스트 생성.
+        avg_vec 불필요. 한 번만 실행 후 A/B 병합 함수에 재사용.
+
+        Args:
+            centroids  : [K] long
+            feat       : [N, D] float  L2 정규화 완료
+            th_sim     : float  최소 유사도 가드
+            th_margin  : float  마진 임계값
+            sim_cutoff : float  히트맵 클리핑 임계값
+
+        Returns:
+            dict:
+              sim_matrix   [K, N]  시드-패치 유사도
+              vom          [K, N] bool  XFeat 귀속용
+              pure         [K, N] bool  앵커 단위 pure (참고용)
+              oc           [N]          패치별 경쟁 앵커 수
+              H_matrix     [K, N]  클리핑된 히트맵
+              heatmap_sim  [K, K]  히트맵 분포 유사도
+              centroids    [K] long
+        """
+        K = centroids.shape[0]
+        device = feat.device
+
+        if K == 0:
+            N, D = feat.shape
+            z = lambda s, t: torch.zeros(s, dtype=t, device=device)
+            return dict(
+                sim_matrix=z((0, N), torch.float32),
+                vom=z((0, N), torch.bool),
+                pure=z((0, N), torch.bool),
+                oc=z((N,), torch.float32),
+                H_matrix=z((0, N), torch.float32),
+                heatmap_sim=z((0, 0), torch.float32),
+                centroids=centroids,
+            )
+
+        # ── 시드 패치 피처 슬라이싱 ─────────────────────────────────
+        seed_feats = feat[centroids.long()]  # [K, D]
+
+        # ── sim_matrix ───────────────────────────────────────────────
+        sim_matrix = torch.mm(seed_feats, feat.t())  # [K, N]
+
+        # ── vom / pure / oc (compute_patch_purity_masks 동일 로직) ──
+        sim_thr = torch.where(sim_matrix >= th_sim,
+                              sim_matrix,
+                              torch.zeros_like(sim_matrix))  # [K, N]
+        max_vals = sim_thr.max(dim=0, keepdim=True).values  # [1, N]
+        margins = max_vals - sim_thr  # [K, N]
+        vom = (sim_thr > 0) & (margins < th_margin)  # [K, N] bool
+        oc = vom.float().sum(dim=0)  # [N]
+        pure = vom & (oc == 1).unsqueeze(0)  # [K, N] bool
+
+        # ── H_matrix / heatmap_sim ───────────────────────────────────
+        H_matrix = torch.where(sim_matrix >= sim_cutoff,
+                               sim_matrix,
+                               torch.zeros_like(sim_matrix))  # [K, N]
+        H_norm = F.normalize(H_matrix, p=2, dim=1)  # [K, N]
+        heatmap_sim = torch.mm(H_norm, H_norm.t())  # [K, K]
+
+        return dict(
+            sim_matrix=sim_matrix,
+            vom=vom,
+            pure=pure,
+            oc=oc,
+            H_matrix=H_matrix,
+            heatmap_sim=heatmap_sim,
+            centroids=centroids,
+        )
+
+    # ============================================================
+    #  METHOD 2. merge_anchors_heatmap  (방식 A)
+    # ============================================================
+    def merge_anchors_heatmap(
+            self,
+            ctx,  # compute_anchor_patch_context 반환값
+            feat,  # [N, D]
+            heatmap_threshold=0.85,
+    ):
+        """
+        [방식 A] 히트맵 분포 유사도 기반 병합.
+
+        adjacency[i,j] = heatmap_sim[i,j] >= heatmap_threshold
+
+        compile_structural_equivalence_vectorized 와 동일 로직이나
+        avg_vec 대신 시드 패치 피처 기반 H_matrix 사용.
+        group_pure는 그룹 간 경쟁 기준으로 재계산.
+
+        Args:
+            ctx               : compute_anchor_patch_context 반환 dict
+            feat              : [N, D]
+            heatmap_threshold : float
+
+        Returns:
+            dict (group_vom, group_pure, avg_vec, valid_groups, group_assign)
+        """
+        vom = ctx['vom']
+        pure = ctx['pure']
+        heatmap_sim = ctx['heatmap_sim']  # [K, K]
+        K = vom.shape[0]
+        device = vom.device
+
+        if K == 0:
+            return _apply_group_and_recompute(
+                vom, pure, feat,
+                np.zeros(0, dtype=np.int32), device
+            )
+
+        # ── adjacency ───────────────────────────────────────────────
+        adj_np = (heatmap_sim >= heatmap_threshold).cpu().numpy().astype(np.int32)
+        np.fill_diagonal(adj_np, 0)
+        adj_np = np.maximum(adj_np, adj_np.T)
+
+        # ── connected_components ─────────────────────────────────────
+        _, group_assign_np = connected_components(
+            csgraph=csr_matrix(adj_np),
+            directed=False, connection='weak', return_labels=True,
+        )
+
+        return self._apply_group_and_recompute(vom, pure, feat, group_assign_np, device)
+
+    # ============================================================
+    #  METHOD 3. merge_anchors_shared_patch  (방식 B)
+    # ============================================================
+    def merge_anchors_shared_patch(
+            self,
+            ctx,  # compute_anchor_patch_context 반환값
+            feat,  # [N, D]
+            th_merge=0.40,
+    ):
+        """
+        [방식 B] 공유 패치 비율 + 시드 포함 기반 병합.
+
+        adjacency[i,j] = ratio_cond[i,j] AND seed_cond[i,j]
+
+        ratio_cond: 양방향 공유 비율 > th_merge
+        seed_cond:  i의 시드가 j의 vom 영역에 포함
+                    OR j의 시드가 i의 vom 영역에 포함
+
+        group_pure는 그룹 간 경쟁 기준으로 재계산.
+
+        Args:
+            ctx      : compute_anchor_patch_context 반환 dict
+            feat     : [N, D]
+            th_merge : float
+
+        Returns:
+            dict (group_vom, group_pure, avg_vec, valid_groups, group_assign)
+        """
+        vom = ctx['vom']
+        pure = ctx['pure']
+        centroids = ctx['centroids']
+        K = vom.shape[0]
+        device = vom.device
+
+        if K == 0:
+            return _apply_group_and_recompute(
+                vom, pure, feat,
+                np.zeros(0, dtype=np.int32), device
+            )
+
+        vom_f = vom.float()  # [K, N]
+
+        # ── ratio_cond ───────────────────────────────────────────────
+        co = torch.mm(vom_f, vom_f.t())  # [K, K]
+        area = vom_f.sum(dim=1)  # [K]
+        overlap_ratio = co / area.unsqueeze(1).clamp(min=1.0)  # [K, K]
+        ratio_cond = (overlap_ratio > th_merge) & \
+                     (overlap_ratio.t() > th_merge)  # [K, K] bool
+
+        # ── seed_cond ────────────────────────────────────────────────
+        # seed_in_j[j, i] = vom_f[j, seed_i]
+        #                  = "앵커 j의 영역에 앵커 i의 시드가 포함"
+        seed_in_j = vom_f[:, centroids.long()]  # [K, K]
+        seed_cond = seed_in_j.t().bool() | seed_in_j.bool()  # [K, K]
+
+        # ── adjacency ───────────────────────────────────────────────
+        adjacency = ratio_cond & seed_cond
+        adjacency.fill_diagonal_(False)
+
+        adj_np = adjacency.cpu().numpy().astype(np.int32)
+        adj_np = np.maximum(adj_np, adj_np.T)
+
+        # ── connected_components ─────────────────────────────────────
+        _, group_assign_np = connected_components(
+            csgraph=csr_matrix(adj_np),
+            directed=False, connection='weak', return_labels=True,
+        )
+
+        return self._apply_group_and_recompute(vom, pure, feat, group_assign_np, device)
+
+    # ============================================================
+    #  METHOD 4. filter_memory_anchors_cross_frame  (다중 프레임)
+    # ============================================================
+    def filter_memory_anchors_cross_frame(
+            self,
+            avg_vec_mem,  # [K_mem, D]
+            feat_cur,  # [N_cur, D]
+            th_sim=0.60,
+            th_margin=0.12,
+            min_pure_response=3,
+    ):
+        """
+        [다중 프레임 전용]
+        메모리 뱅크 앵커를 현재 프레임에 투영하여
+        순수 단독 반응 패치가 부족한 앵커를 cross-attention 전에 배제.
+
+        P1: 현재 프레임에 없는 객체 → pure_area ≈ 0
+        P2: 배경 대면적 앵커        → 배경 패치끼리 경쟁 → pure_area 낮음
+        P3/P4: 오염 앵커            → overlap 다수 → pure_area 낮음
+
+        Returns:
+            valid_mem_mask : [K_mem] bool
+            pure_area_cur  : [K_mem]
+        """
+        sim_cross = torch.mm(avg_vec_mem, feat_cur.t())  # [K_mem, N_cur]
+
+        sim_thr = torch.where(sim_cross >= th_sim,
+                              sim_cross,
+                              torch.zeros_like(sim_cross))
+        #max_vals = sim_thr.max(dim=0, keepdim=True).values
+        self_mask = torch.zeros(K, N, dtype=torch.bool, device=device)
+        self_mask[torch.arange(K, device=device), centroids.long()] = True
+        sim_thr_for_max = sim_thr.masked_fill(self_mask, 0.0)
+        max_vals = sim_thr_for_max.max(dim=0, keepdim=True).values
+
+        margins = max_vals - sim_thr
+
+        valid_cross = (sim_thr > 0) & (margins < th_margin)
+        oc_cur = valid_cross.float().sum(dim=0)
+        pure_cross = valid_cross & (oc_cur == 1).unsqueeze(0)
+        pure_area_cur = pure_cross.float().sum(dim=1)
+
+        valid_mem_mask = pure_area_cur >= min_pure_response
+
+        return valid_mem_mask, pure_area_cur
+
+    # ============================================================
+    #  USAGE EXAMPLE
+    # ============================================================
+    """
+    # ── 전처리 (한 번만) ─────────────────────────────────────────
+    ctx = objpatcher.compute_anchor_patch_context(
+        new_sample_1, feat1,
+        th_sim=0.60, th_margin=0.12, sim_cutoff=0.60,
+    )
+
+    # ── 방식 A: 히트맵 유사도 기반 병합 ─────────────────────────
+    result_a = objpatcher.merge_anchors_heatmap(
+        ctx, feat1, heatmap_threshold=0.85,
+    )
+
+    # ── 방식 B: 공유 패치 + 시드 포함 기반 병합 ─────────────────
+    result_b = objpatcher.merge_anchors_shared_patch(
+        ctx, feat1, th_merge=0.40,
+    )
+
+    # result_a / result_b 공통 키:
+    #   'avg_vec'      [G, D]   cross-attention key/value
+    #   'group_vom'    [G, N]   XFeat 귀속용
+    #   'group_pure'   [G, N]   그룹 간 경쟁 기준 pure
+    #   'valid_groups' [G] bool
+    #   'group_assign' [K] long 디버깅용
+
+    avg_vec_a = result_a['avg_vec'][result_a['valid_groups']]
+    avg_vec_b = result_b['avg_vec'][result_b['valid_groups']]
+
+    # ── 다중 프레임 ─────────────────────────────────────────────
+    valid_mem, pure_area = objpatcher.filter_memory_anchors_cross_frame(
+        avg_vec_a, feat2,
+    )
+    avg_vec_cross = avg_vec_a[valid_mem]
+
+    # ── 시각화 ──────────────────────────────────────────────────
+    visualizer.visualize_pure_vs_overlap_patches(
+        img1, ctx['vom'], ctx['pure'], grid_shape)
+    visualizer.visualize_anchor_refinement_comparison(
+        img1, new_sample_1,
+        ctx['vom'],
+        result_a['group_pure'][result_a['group_assign']],
+        result_a['valid_groups'][result_a['group_assign']],
+        grid_shape,
+    )
+    """
+    ###수정3
+
+    ### 공유 패치 수정2
+
+    # ============================================================
+    #  METHOD 1. compute_patch_purity_masks
+    # ============================================================
+    def compute_patch_purity_masks(self, sim_matrix, th_sim=0.60, th_margin=0.12):
+        """
+        마진 카운팅 기반 패치 분류.
+        detect_mixed_boundary_patches_by_counting 의 내부 마스크를 외부로 분리.
+
+        Args:
+            sim_matrix : [K, N]  앵커-패치 코사인 유사도 행렬
+            th_sim     : float   최소 유사도 가드 (기본 0.60)
+            th_margin  : float   1등과의 마진 임계값 (기본 0.12)
+
+        Returns:
+            valid_overlap_mask : [K, N] bool  마진 이내 전체 반응 (XFeat 귀속용)
+            pure_affinity      : [K, N] bool  단독 점유 패치만  (avg_vec 계산용)
+            overlap_counts     : [N]          패치별 경쟁 앵커 수
+        """
+        # th_sim 미만 → 0
+        sim_thr = torch.where(sim_matrix >= th_sim,
+                              sim_matrix,
+                              torch.zeros_like(sim_matrix))  # [K, N]
+
+        # 패치별 1등 유사도
+        max_vals = sim_thr.max(dim=0, keepdim=True).values  # [1, N]
+
+        # 마진: 1등과의 차이
+        margins = max_vals - sim_thr  # [K, N]
+
+        # 유효 반응: th_sim 통과 AND 마진 < th_margin
+        vom = (sim_thr > 0) & (margins < th_margin)  # [K, N] bool
+
+        # 패치별 경쟁 앵커 수
+        oc = vom.float().sum(dim=0)  # [N]
+
+        # 순수 패치: 단 하나의 앵커만 반응
+        pure = vom & (oc == 1).unsqueeze(0)  # [K, N] bool
+
+        return vom, pure, oc
+
+    def classify_anchor_overlaps_vectorized(
+            self,
+            valid_overlap_mask,
+            th_complete=0.80,
+            th_partial=0.30
+    ):
+        """
+        [진우 박사님 전용 - 유효 반응 마스크 기반 All-Pairs 중복도 정밀 분류 엔진]
+
+        Args:
+            valid_overlap_mask : [K, N] bool  compute_patch_purity_masks의 1번째 아웃풋 (VOM)
+            th_complete        : float        완전 중복(Twin/Subsumed)으로 판정할 임계값 (기본 0.80)
+            th_partial         : float        부분 중복(영역 공유)으로 판정할 하한 임계값 (기본 0.30)
+
+        Returns:
+            dict:
+              complete_pairs : tuple(Tensor, Tensor) 완전 중복인 (anchor_i, anchor_j) 인덱스 쌍
+              partial_pairs  : tuple(Tensor, Tensor) 부분 중복인 (anchor_i, anchor_j) 인덱스 쌍
+              iou_matrix     : [K, K] float          디버깅/시각화용 전수 IoU 행렬
+              overlap_matrix : [K, K] float          i가 j에 포함되는 비대칭 지분율 행렬
+        """
+        K, N = valid_overlap_mask.shape
+        device = valid_overlap_mask.device
+
+        # 비교할 쌍이 없거나 앵커가 부족한 경우 예외 처리
+        if K <= 1:
+            empty_idx = torch.empty(0, dtype=torch.long, device=device)
+            return {
+                "complete_pairs": (empty_idx, empty_idx),
+                "partial_pairs": (empty_idx, empty_idx),
+                "iou_matrix": torch.zeros((K, K), device=device),
+                "overlap_matrix": torch.zeros((K, K), device=device)
+            }
+
+        vom_f = valid_overlap_mask.float()  # [K, N]
+
+        # ── STEP 1. All-pairs 교집합(Intersection) 면적 원샷 산출 ───────
+        # [K, N] @ [N, K] -> [K, K]
+        # inter_matrix[i, j] = 앵커 i와 j가 동시에 공유하는 패치 개수
+        inter_matrix = torch.mm(vom_f, vom_f.t())
+
+        # ── STEP 2. 각 앵커별 유효 영토 면적 산출 ────────────────────────
+        # area 크기: [K]
+        area = vom_f.sum(dim=1)
+
+        # ── STEP 3. 2가지 대수적 지표 컴파일 (Symmetric IoU & Asymmetric Overlap) ──
+        # ① Symmetric IoU 행렬 유도 (두 앵커의 전체 영토 대비 중복도)
+        union_matrix = area.unsqueeze(1) + area.unsqueeze(0) - inter_matrix
+        iou_matrix = inter_matrix / (union_matrix + 1e-8)  # [K, K]
+
+        # ② Asymmetric Overlap Ratio 행렬 유도 (포함 관계 추적용)
+        # overlap_matrix[i, j] = "앵커 i의 전체 면적 중 앵커 j와 겹치는 지분 비율"
+        # 만약 i가 j 내부에 완전히 가려지거나 포함된다면 이 값은 1.0에 수렴합니다.
+        overlap_matrix = inter_matrix / area.unsqueeze(1).clamp(min=1.0)  # [K, K]
+
+        # ── STEP 4. 중복 계산(i-j / j-i) 및 자기 자신(대각선) 소거 가드 ──
+        # 상삼각 행렬(Upper Triangle) 필터를 가동하여 무방향 그래프 에지만 남깁니다.
+        upper_tri_mask = torch.triu(torch.ones((K, K), dtype=torch.bool, device=device), diagonal=1)
+
+        # ── STEP 5. 👑 [박사님 핵심 지시 조건 분기 분할] ──────────────────
+        # 임계값 필터링 조건 기획 (IoU가 높거나, 한쪽이 다른 한쪽에 완전히 먹혔거나)
+        is_complete = (iou_matrix >= th_complete) | (overlap_matrix >= th_complete)
+        is_complete = is_complete & upper_tri_mask
+
+        # 부분 중복 조건 (완전 중복 가드선 아래이면서 최소 기준선 th_partial은 넘긴 애들)
+        is_partial = (iou_matrix >= th_partial) | (overlap_matrix >= th_partial)
+        is_partial = is_partial & (~is_complete) & upper_tri_mask
+
+        # ── STEP 6. 최종 인덱스 좌표록 수사 체계 반환 ────────────────────
+        # torch.where를 때리면 조건이 True인 행(Row)과 열(Col) 인덱스가 튜플로 튀어나옵니다.
+        complete_pairs = torch.where(is_complete)
+        partial_pairs = torch.where(is_partial)
+
+        return {
+            "complete_pairs": complete_pairs,  # (Tensor[num_complete], Tensor[num_complete])
+            "partial_pairs": partial_pairs,  # (Tensor[num_partial], Tensor[num_partial])
+            "iou_matrix": iou_matrix,  # 시각화 격자 투사용
+            "overlap_matrix": overlap_matrix  # 대수 비교 디버깅용
+        }
+
+    # ============================================================
+    #  METHOD 2. merge_anchors_by_seed_overlap  (단일 프레임)
+    # ============================================================
+    def merge_anchors_by_seed_overlap(
+            self,
+            centroids,  # [K] long   앵커 시드 패치 인덱스
+            valid_overlap_mask,  # [K, N] bool
+            pure_affinity,  # [K, N] bool
+            feat,  # [N, D] float  L2 정규화 권장
+            th_merge=0.40,  # 상호 포함 비율 임계값
+            min_area=2,  # 병합 후 최소 순수 패치 수
+    ):
+        """
+        [단일 프레임 전용] 시드 포함 여부 + 공유 비율 기반 앵커 병합.
+
+        병합 조건 (AND):
+          1. ratio_cond : 양방향 공유 비율 > th_merge
+          2. seed_cond  : i의 시드가 j의 vom 영역에 포함
+                          OR j의 시드가 i의 vom 영역에 포함
+
+        connected_components 로 이행적 병합 처리.
+        avg_vec 는 그룹 내 pure_affinity 합집합으로 재계산.
+
+        Args:
+            centroids          : [K]     앵커 시드 인덱스 (long)
+            valid_overlap_mask : [K, N]  XFeat 귀속용 마스크
+            pure_affinity      : [K, N]  avg_vec 계산용 마스크
+            feat               : [N, D]  패치 피처
+            th_merge           : float   공유 비율 임계값
+            min_area           : int     그룹 최소 순수 패치 수
+
+        Returns:
+            avg_vec_merged  : [G, D]    그룹별 대표 벡터 (L2 정규화)
+            group_vom       : [G, N]    그룹별 vom 합집합 (XFeat 귀속용)
+            group_pure      : [G, N]    그룹별 pure 합집합 (avg_vec 기반)
+            valid_groups    : [G] bool  min_area 통과 여부
+            group_assign    : [K]       각 앵커의 그룹 ID (디버깅용)
+        """
+        K, N = valid_overlap_mask.shape
+        D = feat.shape[1]
+        device = valid_overlap_mask.device
+
+        if K == 0:
+            empty = lambda s, t: torch.zeros(s, dtype=t, device=device)
+            return (empty((0, D), torch.float32),
+                    empty((0, N), torch.bool),
+                    empty((0, N), torch.bool),
+                    empty((0,), torch.bool),
+                    empty((0,), torch.long))
+
+        vom_f = valid_overlap_mask.float()  # [K, N]
+        pure_f = pure_affinity.float()  # [K, N]
+
+        # ----------------------------------------------------------
+        # STEP 1. 공유 비율 조건 (ratio_cond)
+        # ----------------------------------------------------------
+        co = torch.mm(vom_f, vom_f.t())  # [K, K]
+        area = vom_f.sum(dim=1)  # [K]
+        overlap_ratio = co / area.unsqueeze(1).clamp(min=1.0)  # [K, K]
+        # overlap_ratio[i,j] = i의 패치 중 j와 겹치는 비율
+
+        ratio_cond = (overlap_ratio > th_merge) & \
+                     (overlap_ratio.t() > th_merge)  # [K, K] bool
+
+        # ----------------------------------------------------------
+        # STEP 2. 시드 포함 조건 (seed_cond)
+        #
+        # vom_f[:, centroids] → [K, K]
+        # seed_in_j[j, i] = vom_f[j, seed_i]
+        #                 = "앵커 j의 영역에 앵커 i의 시드가 포함되는가"
+        #
+        # seed_cond[i, j]:
+        #   i의 시드가 j 영역에 포함(seed_in_j.t())
+        #   OR j의 시드가 i 영역에 포함(seed_in_j)
+        # ----------------------------------------------------------
+        seed_in_j = vom_f[:, centroids.long()]  # [K, K]
+        seed_cond = seed_in_j.t().bool() | seed_in_j.bool()  # [K, K] bool
+
+        # ----------------------------------------------------------
+        # STEP 3. adjacency = ratio_cond AND seed_cond
+        # ----------------------------------------------------------
+        adjacency = (ratio_cond & seed_cond)  # [K, K] bool
+        adjacency.fill_diagonal_(False)
+
+        # 대칭 보장 (i→j 이면 j→i)
+        adj_np = adjacency.cpu().numpy().astype(np.int32)
+        adj_np = np.maximum(adj_np, adj_np.T)
+
+        # ----------------------------------------------------------
+        # STEP 4. connected_components → 그룹 할당
+        # ----------------------------------------------------------
+        n_groups, group_assign = connected_components(
+            csgraph=csr_matrix(adj_np),
+            directed=False,
+            connection='weak',
+            return_labels=True,
+        )
+        # group_assign : [K]  각 앵커의 그룹 ID (0 ~ n_groups-1)
+
+        group_assign_t = torch.tensor(
+            group_assign, dtype=torch.long, device=device
+        )  # [K]
+
+        # ----------------------------------------------------------
+        # STEP 5. 그룹별 vom / pure 합집합 (벡터화)
+        #
+        # one_hot [K, G]  → group_vom[g, n] = 그룹 g 소속 앵커 중
+        #                    적어도 하나가 패치 n에 반응하면 True
+        # ----------------------------------------------------------
+        one_hot = F.one_hot(
+            group_assign_t, num_classes=n_groups
+        ).float()  # [K, G]
+
+        # [G, K] @ [K, N] → [G, N]
+        group_vom_f = torch.mm(one_hot.t(), vom_f)  # [G, N]
+        group_pure_f = torch.mm(one_hot.t(), pure_f)  # [G, N]
+
+        group_vom = group_vom_f > 0  # [G, N] bool
+        group_pure = group_pure_f > 0  # [G, N] bool
+
+        # ----------------------------------------------------------
+        # STEP 6. avg_vec 재계산 (pure 패치만 기여)
+        # ----------------------------------------------------------
+        feature_sums = torch.mm(group_pure_f.clamp(max=1.0), feat)  # [G, D]
+        patch_counts = group_pure.float().sum(dim=1, keepdim=True).clamp(min=1.0)
+        avg_vec_merged = F.normalize(feature_sums / patch_counts,
+                                     p=2, dim=1)  # [G, D]
+
+        # ----------------------------------------------------------
+        # STEP 7. 면적 필터
+        # ----------------------------------------------------------
+        valid_groups = group_pure.float().sum(dim=1) >= min_area  # [G] bool
+
+        return avg_vec_merged, group_vom, group_pure, valid_groups, group_assign_t
+
+    # ============================================================
+    #  METHOD 3. filter_memory_anchors_cross_frame  (다중 프레임)
+    # ============================================================
+    def filter_memory_anchors_cross_frame(
+            self,
+            avg_vec_mem,  # [K_mem, D]  메모리 뱅크 앵커 벡터 (L2 정규화 완료)
+            feat_cur,  # [N_cur, D]  현재 프레임 패치 피처
+            th_sim=0.60,
+            th_margin=0.12,
+            min_pure_response=3,
+    ):
+        """
+        [다중 프레임 전용]
+        메모리 뱅크 앵커를 현재 프레임에 투영하여
+        순수 단독 반응 패치가 부족한 앵커를 cross-attention 전에 배제.
+
+        처리 케이스:
+          P1: 현재 프레임에 없는 객체 (의자 등)  → pure_area ≈ 0
+          P2: 배경 대면적 앵커                   → 배경 패치끼리 경쟁 → pure_area 낮음
+          P3/P4: 오염 앵커                       → overlap 패치 다수 → pure_area 낮음
+
+        Args:
+            avg_vec_mem       : [K_mem, D]
+            feat_cur          : [N_cur, D]
+            th_sim            : float
+            th_margin         : float
+            min_pure_response : int  생존 최소 순수 반응 패치 수
+
+        Returns:
+            valid_mem_mask : [K_mem] bool  True → cross-attention 공급
+            pure_area_cur  : [K_mem]       디버깅용 순수 반응 패치 수
+        """
+        # cross-frame sim
+        sim_cross = torch.mm(avg_vec_mem, feat_cur.t())  # [K_mem, N_cur]
+
+        # 마진 카운팅 (compute_patch_purity_masks 동일 로직)
+        sim_thr = torch.where(sim_cross >= th_sim,
+                              sim_cross,
+                              torch.zeros_like(sim_cross))
+        max_vals = sim_thr.max(dim=0, keepdim=True).values
+        margins = max_vals - sim_thr
+
+        valid_cross = (sim_thr > 0) & (margins < th_margin)  # [K_mem, N_cur]
+        oc_cur = valid_cross.float().sum(dim=0)  # [N_cur]
+
+        # 순수 패치: 현재 프레임에서도 단독 점유
+        pure_cross = valid_cross & (oc_cur == 1).unsqueeze(0)  # [K_mem, N_cur]
+        pure_area_cur = pure_cross.float().sum(dim=1)  # [K_mem]
+
+        valid_mem_mask = pure_area_cur >= min_pure_response  # [K_mem] bool
+
+        return valid_mem_mask, pure_area_cur
+
+    # ============================================================
+    #  USAGE EXAMPLE  (zmq_dino_server.py)
+    # ============================================================
+    """
+    # ── 단일 프레임 ─────────────────────────────────────────────────
+    sim1 = torch.matmul(new_avg_patch_vec1, feat1.t())          # [K, N]
+
+    vom1, pure1, oc1 = objpatcher.compute_patch_purity_masks(sim1)
+
+    avg_vec_merged, group_vom, group_pure, valid_groups, group_assign = \
+        objpatcher.merge_anchors_by_seed_overlap(
+            new_sample_1, vom1, pure1, feat1,
+            th_merge=0.40, min_area=2,
+        )
+
+    # 유효 그룹만 추림
+    avg_vec_final_single = avg_vec_merged[valid_groups]   # [G_valid, D]
+    group_vom_final      = group_vom[valid_groups]        # [G_valid, N]  XFeat 귀속용
+    group_pure_final     = group_pure[valid_groups]       # [G_valid, N]  디버깅용
+
+    # ── 다중 프레임 ─────────────────────────────────────────────────
+    valid_mem, pure_area = objpatcher.filter_memory_anchors_cross_frame(
+        avg_vec_final_single, feat2,
+        th_sim=0.60, th_margin=0.12, min_pure_response=3,
+    )
+    avg_vec_cross = avg_vec_final_single[valid_mem]       # cross-attention key/value
+
+    # ── 시각화 ──────────────────────────────────────────────────────
+    I1, overlap1 = objpatcher.detect_mixed_boundary_patches_by_counting(sim1)
+    visualizer.visualize_pure_vs_overlap_patches(img1, vom1, pure1, grid_shape)
+    visualizer.visualize_seed_filter_result(
+        img1, new_sample_1, oc1,
+        # 병합 후 그룹 정보로 생존 앵커 표시
+        valid_seed_mask=(group_assign >= 0),   # 전체 생존 (배제 없음)
+        grid_shape=grid_shape,
+    )
+    visualizer.visualize_anchor_refinement_comparison(
+        img1,
+        new_sample_1,
+        vom1,                    # 정제 전
+        group_pure[group_assign],  # 정제 후 (각 앵커가 속한 그룹의 pure)
+        valid_groups[group_assign],
+        grid_shape,
+    )
+    """
+    ### 공유 패치 수정2
+
+    # ============================================================
+    #  METHOD 1. compute_patch_purity_masks
+    # ============================================================
+    def compute_patch_purity_masks(self, sim_matrix, th_sim=0.60, th_margin=0.12):
+        """
+        detect_mixed_boundary_patches_by_counting의 내부 마스크들을 외부로 노출.
+        avg_vec 계산(pure_affinity)과 XFeat 귀속(valid_overlap_mask)을 분리하기 위한 기반.
+
+        Args:
+            sim_matrix    : [K, N]  앵커-패치 코사인 유사도 행렬
+            th_sim        : float   최소 유사도 가드 (기본 0.60)
+            th_margin     : float   1등과의 마진 임계값 (기본 0.12)
+
+        Returns:
+            valid_overlap_mask : [K, N] bool  마진 이내 모든 앵커-패치 반응 (XFeat 귀속용)
+            pure_affinity      : [K, N] bool  단독 점유 패치만 (avg_vec 계산용)
+            overlap_counts     : [N]   int    패치별 경쟁 앵커 수
+        """
+        # Step 1. th_sim 미만 → 0 클리핑
+        sim_throttled = torch.where(
+            sim_matrix >= th_sim, sim_matrix, torch.zeros_like(sim_matrix)
+        )
+
+        # Step 2. 패치별 1등 유사도 [1, N]
+        max_vals = sim_throttled.max(dim=0, keepdim=True).values
+
+        # Step 3. 마진 행렬 [K, N]
+        margins = max_vals - sim_throttled
+
+        # Step 4. 유효 반응 마스크: th_sim 통과 AND 마진 < th_margin
+        valid_overlap_mask = (sim_throttled > 0) & (margins < th_margin)  # [K, N] bool
+
+        # Step 5. 패치별 경쟁 앵커 수
+        overlap_counts = valid_overlap_mask.float().sum(dim=0)  # [N]
+
+        # Step 6. 순수 패치 = 단 하나의 앵커만 점유
+        pure_patch_mask = (overlap_counts == 1)  # [N] bool
+        pure_affinity = valid_overlap_mask & pure_patch_mask.unsqueeze(0)  # [K, N] bool
+
+        return valid_overlap_mask, pure_affinity, overlap_counts
+
+    # ============================================================
+    #  METHOD 2. filter_seed_overlap_anchors
+    # ============================================================
+    def filter_seed_overlap_anchors(self, centroids, overlap_counts):
+        """
+        시드 패치(centroid) 자체가 overlap 구간에 속하는 앵커를 배제.
+        시드가 경쟁 구간에 있으면 앵커의 정체성 자체가 불명확하므로 전체 배제.
+
+        Args:
+            centroids      : [K]  앵커 시드 패치 인덱스 (1D long tensor)
+            overlap_counts : [N]  패치별 경쟁 앵커 수
+
+        Returns:
+            valid_mask : [K] bool  True인 앵커만 다음 단계로 진행
+        """
+        # centroids가 가리키는 패치의 overlap_counts 조회
+        seed_counts = overlap_counts[centroids.long()]  # [K]
+        valid_mask = (seed_counts < 2)  # [K] bool  단독 점유 시드만 생존
+        return valid_mask
+
+    # ============================================================
+    #  METHOD 3. refine_anchors_by_pure_affinity  (단일 프레임)
+    # ============================================================
+    def refine_anchors_by_pure_affinity(
+            self, valid_overlap_mask, pure_affinity, feat,
+            th_merge=0.4, min_area=2
+    ):
+        """
+        [단일 프레임 전용]
+        1. valid_overlap_mask 기준으로 앵커 간 공유 패치 비율 계산 → 병합 후보 탐지
+        2. 병합 후보의 pure_affinity 합집합으로 refined_masks 생성
+        3. refined_masks 기반으로 avg_vec 재계산 (overlap 패치 기여 완전 차단)
+
+        Args:
+            valid_overlap_mask : [K, N] bool  XFeat 귀속용 전체 반응 마스크
+            pure_affinity      : [K, N] bool  avg_vec 계산용 순수 패치 마스크
+            feat               : [N, D] float 패치 피처 행렬 (L2 정규화 권장)
+            th_merge           : float  병합 후보 판정 상호 포함 비율 임계값 (기본 0.4)
+            min_area           : int    병합 후 최소 순수 패치 수 (미달 시 앵커 제거)
+
+        Returns:
+            avg_vec_refined : [K, D]   정제된 앵커 대표 벡터 (L2 정규화 완료)
+            refined_masks   : [K, N]   정제된 pure_affinity (병합 반영)
+            valid_after     : [K] bool 면적 필터 통과 여부
+        """
+        K, N = valid_overlap_mask.shape
+        device = valid_overlap_mask.device
+
+        if K == 0:
+            D = feat.shape[1]
+            return (
+                torch.empty((0, D), device=device),
+                torch.zeros((0, N), dtype=torch.bool, device=device),
+                torch.zeros(0, dtype=torch.bool, device=device),
+            )
+
+        # ----------------------------------------------------------
+        # Step 1. 앵커 간 공유 패치 수 및 상호 포함 비율
+        #         (병합 탐지는 valid_overlap_mask 기준 — 겹치는 패치 전체)
+        # ----------------------------------------------------------
+        vom_f = valid_overlap_mask.float()  # [K, N]
+        area = vom_f.sum(dim=1)  # [K]
+
+        co = torch.mm(vom_f, vom_f.t())  # [K, K]
+
+        # overlap_ratio[i, j] = i의 반응 패치 중 j와 겹치는 비율
+        overlap_ratio = co / area.unsqueeze(1).clamp(min=1.0)  # [K, K]
+
+        # 양방향 모두 th_merge 초과 → 병합 후보
+        merge_candidate = (
+                (overlap_ratio > th_merge) & (overlap_ratio.t() > th_merge)
+        )  # [K, K] bool
+        merge_candidate.fill_diagonal_(False)
+
+        # ----------------------------------------------------------
+        # Step 2. 병합 후보의 pure_affinity 합집합 (벡터화)
+        #
+        # merge_candidate [K, K] @ pure_affinity [K, N]
+        # → accumulated[i, n] = i의 병합 후보들 중 패치 n에 반응하는 앵커 수
+        # accumulated > 0 이면 병합 후보 중 적어도 하나가 반응
+        # ----------------------------------------------------------
+        pure_f = pure_affinity.float()  # [K, N]
+        merge_f = merge_candidate.float()  # [K, K]
+
+        accumulated = torch.mm(merge_f, pure_f)  # [K, N]
+        partner_union = (accumulated > 0)  # [K, N] bool
+
+        # 자기 pure_affinity 와 OR
+        refined_masks = pure_affinity | partner_union  # [K, N] bool
+
+        # ----------------------------------------------------------
+        # Step 3. 병합 후보 없는 앵커는 자기 pure_affinity 그대로
+        # ----------------------------------------------------------
+        has_partner = merge_candidate.any(dim=1)  # [K] bool
+        refined_masks = torch.where(
+            has_partner.unsqueeze(1).expand(K, N),
+            refined_masks,
+            pure_affinity,
+        )  # [K, N] bool
+
+        # ----------------------------------------------------------
+        # Step 4. avg_vec 재계산 (pure 패치만 기여)
+        # ----------------------------------------------------------
+        refined_f = refined_masks.float()  # [K, N]
+        feature_sums = torch.mm(refined_f, feat)  # [K, D]
+        patch_counts = refined_f.sum(dim=1, keepdim=True).clamp(min=1.0)
+        avg_vec_refined = F.normalize(feature_sums / patch_counts, p=2, dim=1)  # [K, D]
+
+        # ----------------------------------------------------------
+        # Step 5. 면적 필터: 정제 후 순수 패치 수가 너무 작은 앵커 제거
+        # ----------------------------------------------------------
+        valid_after = refined_f.sum(dim=1) >= min_area  # [K] bool
+
+        return avg_vec_refined, refined_masks, valid_after
+
+    # ============================================================
+    #  METHOD 4. filter_memory_anchors_cross_frame  (다중 프레임)
+    # ============================================================
+    def filter_memory_anchors_cross_frame(
+            self, avg_vec_mem, feat_cur,
+            th_sim=0.60, th_margin=0.12, min_pure_response=3
+    ):
+        """
+        [다중 프레임 전용]
+        메모리 뱅크의 앵커 벡터를 현재 프레임 피처에 투영하여,
+        순수 단독 반응 패치가 부족한 앵커를 cross-attention 전에 배제.
+
+        처리되는 케이스:
+          - P1: 현재 프레임에 없는 객체 (의자 등) → pure_area ≈ 0
+          - P2: 배경 대면적 앵커               → 배경 패치끼리 경쟁 → pure_area 낮음
+          - P3/P4: 오염 앵커                   → overlap 패치 다수 → pure_area 낮음
+
+        Args:
+            avg_vec_mem      : [K_mem, D] 메모리 뱅크 앵커 대표 벡터 (L2 정규화 완료)
+            feat_cur         : [N_cur, D] 현재 프레임 패치 피처 (L2 정규화 권장)
+            th_sim           : float  최소 유사도 가드
+            th_margin        : float  1등과의 마진 임계값
+            min_pure_response: int    생존에 필요한 최소 순수 반응 패치 수
+
+        Returns:
+            valid_mem_mask   : [K_mem] bool  True인 앵커만 cross-attention key/value로 공급
+            pure_area_cur    : [K_mem] int   각 앵커의 현재 프레임 순수 반응 패치 수 (디버깅용)
+        """
+        # cross-frame sim: 메모리 앵커 vs 현재 프레임 패치
+        sim_cross = torch.mm(avg_vec_mem, feat_cur.t())  # [K_mem, N_cur]
+
+        # 마진 카운팅 (compute_patch_purity_masks와 동일 로직)
+        sim_thr = torch.where(
+            sim_cross >= th_sim, sim_cross, torch.zeros_like(sim_cross)
+        )
+        max_vals = sim_thr.max(dim=0, keepdim=True).values
+        margins = max_vals - sim_thr
+
+        valid_cross = (sim_thr > 0) & (margins < th_margin)  # [K_mem, N_cur] bool
+        overlap_cur = valid_cross.float().sum(dim=0)  # [N_cur]
+
+        # 순수 패치 = 현재 프레임에서도 단독 점유
+        pure_cross_mask = (overlap_cur == 1)  # [N_cur] bool
+        pure_cross = valid_cross & pure_cross_mask.unsqueeze(0)  # [K_mem, N_cur] bool
+
+        # 앵커별 순수 반응 패치 수
+        pure_area_cur = pure_cross.float().sum(dim=1)  # [K_mem]
+
+        # 순수 반응이 min_pure_response 이상인 앵커만 생존
+        valid_mem_mask = pure_area_cur >= min_pure_response  # [K_mem] bool
+
+        return valid_mem_mask, pure_area_cur
+
+    # ============================================================
+    #  USAGE EXAMPLE  (zmq_dino_server.py 참고용)
+    # ============================================================
+    """
+    # ── 단일 프레임 파이프라인 ──────────────────────────────────────
+    sim1 = torch.mm(new_avg_patch_vec1, feat1.t())   # [K, N]  기존 코드
+
+    # [기존] detect_mixed_boundary_patches_by_counting (시각화용으로 유지)
+    I1, overlap1 = objpatcher.detect_mixed_boundary_patches_by_counting(sim1)
+
+    # [신규] 순수/오버랩 마스크 분리
+    vom1, pure1, overlap_counts1 = objpatcher.compute_patch_purity_masks(sim1)
+
+    # [신규] 시드가 overlap 구간인 앵커 배제
+    valid_seed1 = objpatcher.filter_seed_overlap_anchors(new_sample_1, overlap_counts1)
+
+    # [신규] 병합 + pure_affinity 기반 avg_vec 재계산
+    avg_vec_refined1, refined_masks1, valid_after1 = objpatcher.refine_anchors_by_pure_affinity(
+        vom1[valid_seed1], pure1[valid_seed1], feat1,
+        th_merge=0.4, min_area=2
+    )
+
+    # XFeat 귀속은 valid_overlap_mask 그대로 사용 (커버리지 유지)
+    vom_for_xfeat = vom1[valid_seed1][valid_after1]   # [K_final, N]
+
+    # memory bank 저장
+    avg_vec_to_store = avg_vec_refined1[valid_after1]  # [K_final, D]
+
+    # ── 다중 프레임 파이프라인 ──────────────────────────────────────
+    valid_mem_mask, pure_area = objpatcher.filter_memory_anchors_cross_frame(
+        avg_vec_to_store, feat2,
+        th_sim=0.60, th_margin=0.12, min_pure_response=3
+    )
+
+    # cross-attention key/value로 공급할 최종 벡터
+    avg_vec_final = avg_vec_to_store[valid_mem_mask]   # [K_clean, D]
+    """
+
+    ### 고민 중
     def detect_mixed_boundary_patches_by_counting(self, sim_matrix, th_sim=0.60, th_margin=0.12):
         """
         [진우 박사님 제안: 전수 마진 카운팅 기반 가림/경계면 패치 지시 함수 (\mathbb{I}_n) 구현]

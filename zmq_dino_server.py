@@ -152,7 +152,7 @@ def inference_loop(zmq_socket):
             affinity1 = objpatcher.build_anchor_to_patch_affinity(sample1, mask1, sim_mat1, exclusive=True)
             avg_patch_vec1, _ = objpatcher.extract_sample_neighborhood_average_pool(x_cat1, affinity1, attn_1)
             # patch cluster
-            group1, n_comp1, heat1 = objpatcher.compile_structural_equivalence_vectorized(feat1, avg_patch_vec1)
+            group1, n_comp1, heat1 = objpatcher.compile_structural_equivalence_vectorized(feat1, feat1[sample1])
 
             new_sample_1 = objpatcher.extract_new_group_centroids_vectorized(
                 sample1_old=sample1, group_assignments=group1, n_components=n_comp1
@@ -166,7 +166,62 @@ def inference_loop(zmq_socket):
             new_avg_patch_vec1, _ = objpatcher.extract_sample_neighborhood_average_pool(x_cat1, new_affinity1, attn_1)
 
             sim1 = torch.matmul(new_avg_patch_vec1, feat1.t())
+            #사용 안할 듯
+            ###공유 패치 기반 단일 프레임 관리
             I1, overlap1 = objpatcher.detect_mixed_boundary_patches_by_counting(sim1)
+
+            ttt1 = time.time()
+
+            ctx = objpatcher.compute_anchor_patch_context(
+                sample1, feat1,
+                th_sim=0.60, th_margin=0.12, sim_cutoff=0.60,
+            )
+            overlap_results = objpatcher.classify_anchor_overlaps_vectorized(ctx['vom'])
+            # ── 방식 A: 히트맵 유사도 기반 병합 ─────────────────────────
+
+            """
+            result_a = objpatcher.merge_anchors_heatmap(
+                ctx, feat1, heatmap_threshold=0.85,
+            )
+            # ── 방식 B: 공유 패치 + 시드 포함 기반 병합 ─────────────────
+            result_b = objpatcher.merge_anchors_shared_patch(
+                ctx, feat1, th_merge=0.40,
+            )
+            # result_a / result_b 공통 키:
+            #   'avg_vec'      [G, D]   cross-attention key/value
+            #   'group_vom'    [G, N]   XFeat 귀속용
+            #   'group_pure'   [G, N]   그룹 간 경쟁 기준 pure
+            #   'valid_groups' [G] bool
+            #   'group_assign' [K] long 디버깅용
+            avg_vec_a = result_a['avg_vec'][result_a['valid_groups']]
+            avg_vec_b = result_b['avg_vec'][result_b['valid_groups']]
+            """
+            ttt2 = time.time()
+            print("valid test = ",id, ttt2-ttt1)
+            ### 공유 패치 시각화
+            #visualizer.visualize_anchor_overlaps_interactive(img1, sample1, ctx['vom'], overlap_results, grid_shape)
+            visualizer.save_anchor_overlaps_batch(
+                base_output_dir="./output_overlaps",  # 🎯 이 폴더 안에 알아서 frame_xxx 폴더가 생성됩니다.
+                frame_id=fid,  # bytes 혹은 str 원본 주입
+                img_bgr=img1,
+                centroids=ctx['centroids'],
+                valid_overlap_mask=ctx['vom'],
+                overlap_results=overlap_results,
+                grid_shape=grid_shape
+            )
+            visualizer.visualize_pure_vs_overlap_patches(
+                img1, ctx['vom'], ctx['pure'], grid_shape)
+            """
+            visualizer.visualize_anchor_refinement_comparison(
+                img_bgr=img1,
+                centroids=ctx['centroids'],
+                valid_overlap_mask=ctx['vom'],  # 정제 전 (VOM)
+                refined_masks=result_a['group_pure'][result_a['group_assign']],  # 💡 명칭 교정 완료
+                valid_after=result_a['valid_groups'][result_a['group_assign']],
+                grid_shape=grid_shape
+            )
+            """
+            ###공유 패치 기반 단일 프레임 관리
 
             link1 = objpatcher.build_anchor_to_anchor_link(new_affinity1)
             bind_xfeat_mat1 = dino_mgr.bind_xfeat_to_patch(kp1, grid_shape)
@@ -185,8 +240,10 @@ def inference_loop(zmq_socket):
             t4 = time.time()
 
             #visualizer.visualize_cls_attention_opencv(img1, attn_1, grid_shape)
-            visualizer.visualize_exclusive_master_groups(img1, new_sample_1, new_affinity1, grid_shape)
-            visualizer.visualize_mixed_boundary_patches(img1, I1, grid_shape, overlap1)
+
+            #visualizer.visualize_exclusive_master_groups(img1, new_sample_1, new_affinity1, grid_shape)
+            #visualizer.visualize_mixed_boundary_patches(img1, I1, grid_shape, overlap1)
+
             #visualizer.visualize_anchor_relations(img1, new_sample_1, mask1, link1, grid_shape)
             #visualizer.visualize_sample_to_sample_similarity(img1, new_sample_1, new_avg_patch_vec1, new_affinity1, grid_shape)
             #visualizer.visualize_new_structural_grouping(img1, new_sample_1, new_affinity1, group1, heat1, n_comp1, grid_shape)
@@ -219,8 +276,7 @@ def inference_loop(zmq_socket):
             """
             """"""
 
-
-            if best_target is not None:
+            if False and best_target is not None:
                 tsrc, tfid = best_target
                 print(f"🎯 [최적 대조 씬 선별] 현재: {current_frame_idx} ↔ 타겟: {tfid.decode()} (프레임 간격: {max_temporal_dist})")
 
@@ -276,7 +332,7 @@ def inference_loop(zmq_socket):
                 )
 
             etime = time.time()
-            cv2.waitKey()
+            cv2.waitKey(1)
             print("처리", fid, etime-stime, len(list_neigh_frames), " salad 처리 = ", t1-stime, ", 디노 인코딩 = ", t2-t1, ", 디노 패치 벡터 = ", t3-t2, etime-t4)
 
 
