@@ -280,6 +280,10 @@ class GlobalObjectBank:
     def _update(self, gid, vec, cx, cy, pure_area,
                 pv_ratio, sp_std, frame_id):
         e = self._entries[gid]
+        # 프레임당 1회만 갱신 — 같은 프레임 내 여러 앵커가 같은 gid에 매칭돼도
+        # EMA/centroid/frame_count 가 중복 갱신되지 않도록 첫 매칭만 반영
+        if frame_id == e.last_frame_id:
+            return
         a = self.ema_alpha
 
         # avg_vec EMA
@@ -301,7 +305,7 @@ class GlobalObjectBank:
                 var = float(np.var(xs) + np.var(ys))
                 e.split_candidate = var > self.centroid_var_threshold
 
-        e.frame_count   += 1
+        e.frame_count   += 1          # 위 early-return 으로 고유 프레임당 1회 보장
         e.last_frame_id  = frame_id
 
     def _compute_centroids_from_vom(self, vom, grid_shape, K):

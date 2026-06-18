@@ -60,9 +60,53 @@ class DinoSemanticObjectExtractorV2(DinoSemanticObjectExtractor):
         detect_multiresponse    (= detect_mixed_boundary_patches_by_counting)
     """
 
-    def __init__(self, *args, timing: bool = False, **kwargs):
+    def __init__(self, *args, timing: bool = False, stage_impl: dict = None, **kwargs):
         super().__init__(*args, **kwargs)
         self.timing = timing  # True 이면 각 서브스텝 처리 시간 출력
+
+        # 스테이지 → 실제 구현 메서드명 매핑. 런타임/호출 시점에 교체 가능하여
+        # 각 단계의 알고리즘을 alias 수정 없이 갈아끼울 수 있다(ablation/실험용).
+        self.stage_impl = {
+            "generate_seeds":          "sample_patch",
+            "group_anchors":           "merge_anchors_heatmap",
+            "compute_anchor_response": "_apply_group_and_recompute",
+            "project_memory_to_frame": "filter_memory_anchors_cross_frame",
+            "recompute_anchor_vecs":   "extract_sample_neighborhood_average_pool",
+            "filter_anchors":          "filter_by_quality",
+            "detect_multiresponse":    "detect_mixed_boundary_patches_by_counting",
+        }
+        if stage_impl:
+            self.stage_impl.update(stage_impl)
+
+    def set_stage_impl(self, stage: str, method):
+        """스테이지 구현 교체. method 는 메서드명(str) 또는 callable."""
+        self.stage_impl[stage] = method
+
+    def _run_stage(self, stage, *args, method=None, **kwargs):
+        """stage 에 매핑된 구현을 실행. method 로 호출 시점 1회 오버라이드 가능.
+        method/매핑 값은 메서드명(str, getattr) 또는 callable 둘 다 허용."""
+        impl = method or self.stage_impl.get(stage, stage)
+        fn = impl if callable(impl) else getattr(self, impl)
+        return fn(*args, **kwargs)
+
+    @staticmethod
+    def _reduce_ctx(ctx, keep):
+        """keep(bool [K]) 마스크로 ctx 의 앵커 차원을 줄인다 (텐서는 참조 슬라이싱).
+        K 차원 배열(vom/pure/sim_matrix/H_matrix/avg_vec/sample/centroids/heatmap_sim)만 축소."""
+        keep = keep.bool()
+        out = dict(ctx)                                   # 얕은 복사(참조만, 데이터 복사 아님)
+        K = keep.shape[0]
+        for k in ("vom", "pure", "sim_matrix", "H_matrix", "avg_vec", "sample", "centroids"):
+            v = out.get(k)
+            if isinstance(v, torch.Tensor) and v.shape and v.shape[0] == K:
+                out[k] = v[keep]
+        hs = out.get("heatmap_sim")
+        if isinstance(hs, torch.Tensor) and hs.shape[:1] == (K,):
+            out["heatmap_sim"] = hs[keep][:, keep]
+        if isinstance(out.get("vom"), torch.Tensor) and out["vom"].numel():
+            out["oc"] = out["vom"].sum(dim=0)
+        out["K"] = int(keep.sum())
+        return out
 
     # ──────────────────────────────────────────────────────────────
     # 타이밍 헬퍼
@@ -79,40 +123,35 @@ class DinoSemanticObjectExtractorV2(DinoSemanticObjectExtractor):
     # 1. compute_anchor_patch_context
     # ──────────────────────────────────────────────────────────────
 
-    def compute_anchor_patch_context(self, centroids, feat,
+    def compute_anchor_patch_context(self, centroids, feat, self_idx=None,
                                      th_sim=0.60, th_heat=0.65, th_margin=0.12,
                                      use_heatmap_vom=False):
-        """
-        앵커별 패치 컨텍스트를 한 번에 계산.
+        """앵커별 패치 컨텍스트를 한 번에 계산 (단일/크로스 프레임 공용).
 
-        valid_overlap_mask (vom) [K, N] bool
-            — 1등 앵커와 마진 < th_margin 인 패치. XFeat 귀속에 사용.
-        pure_affinity (pure) [K, N] bool
-            — 단독 점유 패치 (oc == 1). avg_vec 계산에만 사용.
+        centroids:
+            [K]   long  → 단일 프레임. feat 내 시드 인덱스 (query=feat[idx], 자기 시드 마스킹 자동)
+            [K,D] float → 크로스 프레임. 쿼리 벡터(메모리 뱅크 등). 마스킹 없음.
+        feat      : [N, D] L2 정규화 대상 프레임 패치 피처
+        self_idx  : [K] or None — 명시 시 자기 시드 마스킹 위치 (단일은 자동 설정)
 
-        핵심 버그 픽스 — 자기 시드 마스킹:
-            시드는 자기 자신에 sim≈1.0 → max_vals 항상 1.0
-            → 다른 앵커의 margin이 항상 th_margin 초과 → vom 전체 False
-            → 수정: max_vals 계산 시 자기 시드 위치를 0으로 마스킹
+        valid_overlap_mask (vom) [K, N] bool — 1등 앵커와 마진 < th_margin (XFeat 귀속)
+        pure_affinity (pure) [K, N] bool      — 단독 점유 패치 (oc == 1)
 
-        Returns:
-            ctx dict:
-                centroids   [K]
-                sim_matrix  [K, N] float32
-                vom         [K, N] bool
-                pure        [K, N] bool
-                oc          [N]    long      — overlap counts
-                H_matrix    [K, N] float32   — 노이즈 압착 히트맵
-                heatmap_sim [K, K] float32   — 앵커 간 히트맵 유사도
-                K, N        int
+        자기 시드 마스킹: 쿼리가 feat 안의 패치일 때(단일) 시드가 자기 자신에 sim≈1.0 →
+        max_vals 오염 → vom 전체 False. 크로스(쿼리=메모리 벡터)는 feat에 그 패치가
+        없으므로 마스킹하지 않는다.
+
+        Returns ctx dict: centroids, sim_matrix[K,N], vom[K,N], pure[K,N],
+                          oc[N], H_matrix[K,N], heatmap_sim[K,K], K, N
+        (heatmap_sim 은 merge 용 — 단일/메모리 모두 계산)
         """
         t0 = time.time()
-        K = centroids.shape[0]
         N = feat.shape[0]
         device = feat.device
+        K = centroids.shape[0]
 
-        _ekn = torch.zeros((0, N), dtype=torch.bool, device=device)
         if K == 0:
+            _ekn = torch.zeros((0, N), dtype=torch.bool, device=device)
             return dict(
                 centroids=centroids,
                 sim_matrix=torch.zeros((0, N), device=device),
@@ -123,18 +162,31 @@ class DinoSemanticObjectExtractorV2(DinoSemanticObjectExtractor):
                 K=0, N=N,
             )
 
-        seed_feats = feat[centroids.long()]              # [K, D]
-        sim_matrix = torch.mm(seed_feats, feat.t())      # [K, N]
+        # 쿼리 결정: 1D=시드 인덱스(단일), 2D=쿼리 벡터(크로스)
+        if centroids.dim() == 1:
+            seed_idx = centroids.long()
+            query = feat[seed_idx]                       # [K, D]
+            if self_idx is None:
+                self_idx = seed_idx                      # 단일 프레임 → 자기 시드 마스킹
+            ret_centroids = seed_idx
+        else:
+            query = centroids                            # [K, D] 쿼리 벡터(메모리 등)
+            ret_centroids = None
+
+        query      = F.normalize(query, p=2, dim=1)
+        sim_matrix = torch.mm(query, feat.t())           # [K, N]
         t0 = self._tlog("ctx: sim_matrix mm", t0)
 
         sim_thr    = torch.where(sim_matrix >= th_sim,
                                  sim_matrix,
                                  torch.zeros_like(sim_matrix))
 
-        # 자기 시드 마스킹
-        self_mask = torch.zeros(K, N, dtype=torch.bool, device=device)
-        self_mask[torch.arange(K, device=device), centroids.long()] = True
-        sim_thr_for_max = sim_thr.masked_fill(self_mask, 0.0)
+        # 자기 시드 마스킹 (단일 프레임에서만)
+        sim_thr_for_max = sim_thr
+        if self_idx is not None:
+            self_mask = torch.zeros(K, N, dtype=torch.bool, device=device)
+            self_mask[torch.arange(K, device=device), self_idx.long()] = True
+            sim_thr_for_max = sim_thr.masked_fill(self_mask, 0.0)
         max_vals = sim_thr_for_max.max(dim=0, keepdim=True).values  # [1, N]
 
         if use_heatmap_vom:
@@ -150,11 +202,11 @@ class DinoSemanticObjectExtractorV2(DinoSemanticObjectExtractor):
                                   sim_matrix,
                                   torch.zeros_like(sim_matrix))
         H_norm      = F.normalize(H_matrix, p=2, dim=1)
-        heatmap_sim = torch.mm(H_norm, H_norm.t())        # [K, K]
+        heatmap_sim = torch.mm(H_norm, H_norm.t())        # [K, K]  (merge 용, 단일/메모리 공용)
         self._tlog("ctx: heatmap_sim", t0)
 
         return dict(
-            centroids=centroids,
+            centroids=ret_centroids,
             sim_matrix=sim_matrix,
             vom=vom, pure=pure, oc=oc,
             H_matrix=H_matrix,
@@ -554,34 +606,192 @@ class DinoSemanticObjectExtractorV2(DinoSemanticObjectExtractor):
         return valid_mask, pure_area_cur, vom, pure
 
     # ──────────────────────────────────────────────────────────────
-    # 파이프라인 통일 API — alias
-    # 서버 코드가 아래 이름으로 호출하면 내부 구현 교체 시 alias만 수정
+    # 파이프라인 통일 API — 스테이지 디스패치
+    #   각 스테이지는 self.stage_impl[stage] 에 매핑된 구현으로 라우팅된다.
+    #   교체 방법:
+    #     - 전역:   objpatcher.set_stage_impl("filter_anchors", "my_filter")
+    #               objpatcher.stage_impl["filter_anchors"] = some_callable
+    #     - 호출시: objpatcher.filter_anchors(..., method="my_filter")
+    #               objpatcher.filter_anchors(..., method=some_callable)
     # ──────────────────────────────────────────────────────────────
 
-    def generate_seeds(self, *args, **kwargs):
-        """STAGE: generate_seeds — sample_patch alias"""
-        return self.sample_patch(*args, **kwargs)
+    def generate_seeds(self, *args, method=None, **kwargs):
+        """STAGE: generate_seeds (기본 sample_patch)"""
+        return self._run_stage("generate_seeds", *args, method=method, **kwargs)
 
-    def group_anchors(self, *args, **kwargs):
-        """STAGE: group_anchors — merge_anchors_heatmap alias"""
-        return self.merge_anchors_heatmap(*args, **kwargs)
+    def group_anchors(self, *args, method=None, **kwargs):
+        """STAGE: group_anchors (기본 merge_anchors_heatmap)"""
+        return self._run_stage("group_anchors", *args, method=method, **kwargs)
 
-    def compute_anchor_response(self, *args, **kwargs):
-        """STAGE: compute_anchor_response — _apply_group_and_recompute alias"""
-        return self._apply_group_and_recompute(*args, **kwargs)
+    def compute_anchor_response(self, *args, method=None, **kwargs):
+        """STAGE: compute_anchor_response (기본 _apply_group_and_recompute)
 
-    def project_memory_to_frame(self, *args, **kwargs):
-        """STAGE: project_memory_to_frame — filter_memory_anchors_cross_frame alias"""
-        return self.filter_memory_anchors_cross_frame(*args, **kwargs)
+        ctx 모드: 첫 인자가 dict 이면 ctx 에서 필요한 필드를 꺼내 실행 후 결과를
+        ctx 에 써넣어 반환. (ctx 필요 필드: centroids, group_labels, n_comp,
+        feat, x_cat, [attn], [grid_shape])
+        위치인자 모드(기존): compute_anchor_response(centroids, group_labels, n_comp,
+        ctx, feat, x_cat, attn=, grid_shape=) 그대로 동작.
+        """
+        if args and isinstance(args[0], dict):
+            ctx = args[0]
+            nc, gvom, gpure, avg, new_ctx = self._run_stage(
+                "compute_anchor_response",
+                ctx["centroids"], ctx["group_labels"], ctx["n_comp"],
+                ctx, ctx["feat"], ctx["x_cat"],
+                attn=ctx.get("attn"), grid_shape=ctx.get("grid_shape"),
+                method=method, **kwargs)
+            new_ctx = dict(new_ctx)
+            new_ctx.update({
+                "centroids": nc, "sample": nc, "vom": gvom, "pure": gpure,
+                "avg_vec": avg,
+                "feat": ctx["feat"], "x_cat": ctx["x_cat"],
+                "attn": ctx.get("attn"), "grid_shape": ctx.get("grid_shape"),
+            })
+            return new_ctx
+        return self._run_stage("compute_anchor_response", *args, method=method, **kwargs)
 
-    def recompute_anchor_vecs(self, *args, **kwargs):
-        """STAGE: recompute_anchor_vecs — extract_sample_neighborhood_average_pool alias"""
-        return self.extract_sample_neighborhood_average_pool(*args, **kwargs)
+    def project_memory_to_frame(self, *args, method=None, **kwargs):
+        """STAGE: project_memory_to_frame (기본 filter_memory_anchors_cross_frame)"""
+        return self._run_stage("project_memory_to_frame", *args, method=method, **kwargs)
 
-    def filter_anchors(self, *args, **kwargs):
-        """STAGE: filter_anchors — filter_by_quality alias"""
-        return self.filter_by_quality(*args, **kwargs)
+    def recompute_anchor_vecs(self, *args, method=None, **kwargs):
+        """STAGE: recompute_anchor_vecs (기본 extract_sample_neighborhood_average_pool)"""
+        return self._run_stage("recompute_anchor_vecs", *args, method=method, **kwargs)
 
-    def detect_multiresponse(self, *args, **kwargs):
-        """STAGE: detect_multiresponse — detect_mixed_boundary_patches_by_counting alias"""
-        return self.detect_mixed_boundary_patches_by_counting(*args, **kwargs)
+    def filter_anchors(self, *args, method=None, reduce=True, **kwargs):
+        """STAGE: filter_anchors (기본 filter_by_quality)
+
+        ctx 모드: 첫 인자가 dict 이면 ctx["vom"]/ctx["pure"]/ctx["grid_shape"]를
+        꺼내 keep(valid_mask) 계산 → ctx["keep"] 저장 → reduce=True 면 keep 으로
+        ctx 앵커 차원 축소하여 반환. (데이터 복사 없이 참조 슬라이싱)
+        위치인자 모드(기존): filter_anchors(vom, pure, ...) → keep 반환.
+        """
+        if args and isinstance(args[0], dict):
+            ctx = args[0]
+            kwargs.setdefault("grid_shape", ctx.get("grid_shape"))
+            keep = self._run_stage("filter_anchors", ctx["vom"], ctx["pure"],
+                                   method=method, **kwargs)
+            ctx["keep"] = keep
+            return self._reduce_ctx(ctx, keep) if reduce else ctx
+        return self._run_stage("filter_anchors", *args, method=method, **kwargs)
+
+    def detect_multiresponse(self, *args, method=None, **kwargs):
+        """STAGE: detect_multiresponse (기본 detect_mixed_boundary_patches_by_counting)"""
+        return self._run_stage("detect_multiresponse", *args, method=method, **kwargs)
+
+    # ──────────────────────────────────────────────────────────────
+    # PHASE 2 — 객체 벡터 표현 + 메모리 풀 (서버 인라인에서 이관)
+    # ──────────────────────────────────────────────────────────────
+
+    def compute_object_vectors(self, feat, sample, vom, attn=None,
+                               repr="avg", weight="uniform", overlap="exclude"):
+        """앵커별 객체 벡터 계산 (표현/가중/중복처리 토글).
+
+        feat    : [N, D] L2 정규화 패치 피처
+        sample  : [K]    앵커 대표(시드) 패치 인덱스
+        vom     : [K, N] valid_overlap_mask (bool)
+        attn    : [N] 또는 [1, N] CLS attention (weight='attn' 시 필요)
+        repr    : 'avg' | 'patch'
+        weight  : 'uniform' | 'attn' | 'sim'
+        overlap : 'keep'(vom 전체) | 'exclude'(pure, 기본) | 'argmax'(중복은 최고 sim 앵커)
+        반환    : [K, D] L2 정규화 객체 벡터
+        """
+        D = feat.shape[1]
+        K = int(vom.shape[0])
+        if K == 0:
+            return torch.zeros((0, D), device=feat.device)
+
+        # 대표 패치 표현
+        if repr == "patch":
+            return F.normalize(feat[sample], p=2, dim=1)
+
+        # ---- 평균(avg) 표현 ----
+        vom_b = vom.bool()
+        oc = vom_b.sum(dim=0)                                  # [N] overlap count
+
+        if overlap == "exclude":
+            membership = vom_b & (oc == 1).unsqueeze(0)        # pure
+        elif overlap == "argmax":
+            sim_seed = feat[sample] @ feat.t()                 # [K, N]
+            winner = sim_seed.masked_fill(~vom_b, float("-inf")).argmax(dim=0)  # [N]
+            membership = torch.zeros_like(vom_b)
+            n_idx = torch.nonzero(oc > 0, as_tuple=True)[0]
+            membership[winner[n_idx], n_idx] = True
+        else:  # keep
+            membership = vom_b
+
+        # 가중치 [K, N]
+        if weight == "attn" and attn is not None:
+            w = attn.reshape(1, -1).to(feat.device).expand(K, -1).clone()
+        elif weight == "sim":
+            w = (feat[sample] @ feat.t()).clamp(min=0.0)
+        else:  # uniform
+            w = torch.ones((K, feat.shape[0]), device=feat.device)
+
+        w = w * membership.float()
+        denom = w.sum(dim=1, keepdim=True).clamp(min=1e-8)
+        vecs = (w @ feat) / denom                              # [K, D]
+        return F.normalize(vecs, p=2, dim=1)
+
+    def build_object_vector_pool(self, dino_mgr, neigh_keys,
+                                 repr="avg", max_frames=5):
+        """인접 프레임 저장 데이터에서 객체 벡터 풀 구성.
+
+        dino_mgr.get(src, fid) → (x_cat, sample, vom, avg_vec, bind_xfeat)
+          repr='avg'   : 저장된 avg_vec(slot 3) 사용
+          repr='patch' : x_cat(slot 0)+sample(slot 1)로 대표 패치 피처 재구성
+        반환: pool_vecs [M, D] (cpu), pool_meta list[(src, fid, k)]
+        """
+        vecs, meta, cnt = [], [], 0
+        for (nsrc, nfid) in neigh_keys:
+            if cnt >= max_frames:
+                break
+            try:
+                data = dino_mgr.get(nsrc, nfid)
+            except Exception:
+                continue
+            if repr == "patch":
+                x_cat, sample = data[0], data[1]
+                if sample is None or sample.shape[0] == 0:
+                    continue
+                feat, _, _ = self._prepare_features(x_cat)
+                vec = F.normalize(feat[sample], p=2, dim=1)
+            else:
+                vec = data[3]
+            if vec is None or vec.shape[0] == 0:
+                continue
+            vecs.append(vec.cpu())
+            for k in range(vec.shape[0]):
+                meta.append((nsrc, nfid, k))
+            cnt += 1
+        if not vecs:
+            return None, []
+        return torch.cat(vecs, dim=0), meta
+
+    @staticmethod
+    def select_object_vectors(pool_vecs, sim_thresh=0.90, max_k=64):
+        """풀에서 중복 객체 표현을 greedy 제거 후 대표 벡터 선택.
+        반환: sel_vecs [K, D], keep_idx [K]
+        """
+        if pool_vecs is None or pool_vecs.shape[0] == 0:
+            return None, None
+        v = F.normalize(pool_vecs.float(), dim=1)
+        M = v.shape[0]
+        sim = v @ v.t()
+        taken = torch.zeros(M, dtype=torch.bool)
+        keep = []
+        for i in range(M):
+            if taken[i]:
+                continue
+            keep.append(i)
+            taken |= (sim[i] >= sim_thresh)
+            if len(keep) >= max_k:
+                break
+        keep_idx = torch.tensor(keep, dtype=torch.long)
+        return pool_vecs[keep_idx], keep_idx
+
+    ##직접 구현
+    def test_group(self, ctx, grid_shape):
+        print("group test etsestestset testset testset")
+    def test_filter(self, ctx, grid_shape):
+        print("filter test etsestestset testset testset")

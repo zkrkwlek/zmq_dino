@@ -157,14 +157,17 @@ class SaladDataManager(InferenceDataManager):
         if src not in self.storage:
             self.storage[src] = {}
         ckeys = []
-        for n_idx in neigh_idx:
+        # 인접 리스트는 (key, sim) 튜플로 저장한다.
+        # 코사인 유사도는 대칭이므로 역방향 링크에도 동일 sim 을 그대로 사용.
+        for n_idx, n_sim in zip(neigh_idx, frame_distances):
             cand_src, cand_fid = self.metadata[n_idx.item()]
             ckey = (cand_src, cand_fid)
             if key == ckey:
                 continue
-            ckeys.append(ckey)
-            #캔디데이트 키들도 데이터를 추가
-            self.storage[cand_src][cand_fid].append(key)
+            sim = float(n_sim.item())
+            ckeys.append((ckey, sim))
+            #캔디데이트 키들도 데이터를 추가 (동일 sim)
+            self.storage[cand_src][cand_fid].append((key, sim))
         self.storage[src][fid] = ckeys
 
 #cpu에 기록 후 필요할 때 load

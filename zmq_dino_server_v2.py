@@ -179,7 +179,8 @@ def pick_best_target(list_neigh_frames, cur_src: bytes, cur_fid: bytes,
     other_device = []
     same_device  = []
 
-    for tsrc, tfid in list_neigh_frames:
+    for (tkey, _sim) in list_neigh_frames:   # list_neigh = (key, sim) 튜플
+        tsrc, tfid = tkey
         try:
             tfid_int = int(tfid.decode())
         except Exception:

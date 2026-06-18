@@ -53,13 +53,25 @@ RECV_KW = [b"image", b"salad_res", b"xfeat_kp_res", b"xfeat_desc_res"]
 # 크로스 프레임 경로를 유지하는 최소 유효 앵커 수
 MIN_CROSS_ANCHORS = 3
 
+# ── PHASE 2: SALAD 메모리 풀 구성 파라미터 (아키텍처 v2) ──────────────────────
+POOL_MAX_FRAMES   = 5      # 풀에 포함할 최대 인접 프레임 수
+POOL_DEDUP_SIM    = 0.90   # 객체 벡터 중복 제거 코사인 임계값
+POOL_MAX_ANCHORS  = 64     # 풀에서 선택할 최대 객체 벡터 수
+
+# ── 앵커 객체 표현 방식 (ablation 토글, objpatcher.compute_object_vectors) ────
+#   ANCHOR_REPR  : "avg"(패치 평균) | "patch"(대표 시드 패치 피처)
+#   AVG_WEIGHT   : "uniform"(단순평균) | "attn"(CLS attention 가중) | "sim"(유사도 가중)
+#   OVERLAP_MODE : "exclude"(pure, 중복 배제) | "keep"(vom 전체) | "argmax"(중복은 최고 sim 앵커)
+ANCHOR_REPR  = "patch"
+AVG_WEIGHT   = "uniform"
+OVERLAP_MODE = "exclude"
+
 # ── 디버그 시각화 설정 ────────────────────────────────────────────────────────
-DEBUG_VIS        = True          # True 로 바꾸면 각 Phase 시각화 저장
+DEBUG_VIS        = False          # True 로 바꾸면 각 Phase 시각화 저장
 DEBUG_VIS_DIR    = './debug_v3'   # 저장 경로
-DEBUG_VIS_PHASES = {2,3,4,5,6}           # None=전체  예: {1, 4, 5} 일부만 활성화
+DEBUG_VIS_PHASES = {3,4,5,6}           # None=전체  예: {1, 4, 5} 일부만 활성화
 
 task_queue = Queue(maxsize=10)
-
 
 # GlobalObjectBank 는 global_object_bank.py 에서 import
 
@@ -76,7 +88,8 @@ def pick_best_target(list_neigh_frames, cur_src: bytes, cur_fid: bytes,
     cur_fid_int = int(cur_fid.decode()) if cur_fid else 0
     other_device, same_device = [], []
 
-    for tsrc, tfid in list_neigh_frames:
+    for (tkey, _sim) in list_neigh_frames:   # list_neigh = (key, sim) 튜플
+        tsrc, tfid = tkey
         try:
             tfid_int = int(tfid.decode())
         except Exception:
@@ -97,6 +110,13 @@ def pick_best_target(list_neigh_frames, cur_src: bytes, cur_fid: bytes,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# PHASE 2 메모리 풀(build_object_vector_pool / select_object_vectors)과
+# 객체 벡터 표현(compute_object_vectors)은 patchcluster_v2(objpatcher)로 이관됨.
+# 서버는 데이터(dino_mgr)만 넘기고 호출한다.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # inference_loop
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -108,6 +128,8 @@ def inference_loop(zmq_socket):
         dino_mgr   = DINODataManager()
         matcher    = DinoXFeatPatchMatcher()
         objpatcher = DinoSemanticObjectExtractorV2(timing=True)
+        objpatcher.set_stage_impl("filter_anchors", "test_filter")
+        objpatcher.set_stage_impl("compute_anchor_response", "test_group")
         obj_bank   = GlobalObjectBank(
             reid_threshold=0.75,
             ema_alpha=0.3,
@@ -151,16 +173,20 @@ def inference_loop(zmq_socket):
 
             # Phase 2 디버그 — 인접 프레임 이미지 로드 (있는 것만)
             if vis_dbg is not None and list_neigh:
-                _neigh_imgs, _neigh_sims = [], []
-                for _ns, _nf in list_neigh[:5]:
+                # 인접 프레임만 (self 는 list_neigh 단계에서 이미 제외됨)
+                _neigh_imgs, _neigh_sims, _labels = [], [], []
+                for (_nkey, _nsim) in list_neigh[:5]:   # (key, sim)
+                    _ns, _nf = _nkey
                     try:
                         _neigh_imgs.append(img_mgr.get(_ns, _nf))
-                        _neigh_sims.append(1.0)   # salad_mgr에 sim score 없으면 1.0
+                        _neigh_sims.append(_nsim)        # 실제 SALAD 코사인 sim
+                        _labels.append(f"{_ns.decode()}:{_nf.decode()}")
                     except Exception:
                         break
                 if _neigh_imgs:
-                    _sel = [0] if best_target is not None and list_neigh[0] == best_target else []
-                    vis_dbg.phase2_neighbor_frames(_neigh_imgs, _neigh_sims, _sel)
+                    _sel = [0] if (best_target is not None and list_neigh[0][0] == best_target) else []
+                    vis_dbg.phase2_neighbor_frames(_neigh_imgs, _neigh_sims,
+                                                   selected_idx=_sel, labels=_labels)
 
             # ── 3. DINOv2 피처 추출 (항상) ────────────────────────────────
             tensor1, (W, H) = model.preprocess_cv2(img_rgb1)
@@ -185,44 +211,63 @@ def inference_loop(zmq_socket):
             work_pure    = None    # [K, N] pure
             work_avg_vec = None    # [K, D]
 
-            # ── 4-A. 크로스 프레임 경로 ──────────────────────────────────
+            # ── 4-A. 크로스 프레임 경로 (PHASE 2 풀 기반) ────────────────
             target_has_memory = False
+            avg_vec_mem  = None    # [M, D] 풀에서 선택된 메모리 객체 벡터
+            work_mem_vec = None    # [K_cross, D] 매칭(smat)용 메모리 벡터
+
             if best_target is not None:
-                try:
-                    target_has_memory = dino_mgr.has(best_target[0], best_target[1])
-                except AttributeError:
-                    # DINODataManager에 has() 없으면 get()으로 존재 확인
-                    try:
-                        dino_mgr.get(best_target[0], best_target[1])
-                        target_has_memory = True
-                    except Exception:
-                        target_has_memory = False
+                # PHASE 2: 인접 프레임 풀 구성 → 중복 제거 → 대표 벡터 선택
+                #   list_neigh 는 (key, sim) 튜플 → key 만 추출, best_target 우선 포함
+                neigh_keys = [k for (k, _s) in list_neigh]
+                pool_neigh = [best_target] + [k for k in neigh_keys if k != best_target]
+                pool_vecs, _pool_meta = objpatcher.build_object_vector_pool(
+                    dino_mgr, pool_neigh, repr=ANCHOR_REPR, max_frames=POOL_MAX_FRAMES)
+                sel_vecs, _keep_idx   = objpatcher.select_object_vectors(
+                    pool_vecs, sim_thresh=POOL_DEDUP_SIM, max_k=POOL_MAX_ANCHORS)
+                if sel_vecs is not None and sel_vecs.shape[0] > 0:
+                    avg_vec_mem       = sel_vecs.cuda()
+                    target_has_memory = True
+
+                # Phase 2 디버그 — 메모리 풀 + 선택 결과 (PCA 산점도)
+                if vis_dbg is not None and pool_vecs is not None:
+                    _selm = torch.zeros(pool_vecs.shape[0], dtype=torch.bool)
+                    if _keep_idx is not None:
+                        _selm[_keep_idx] = True
+                    vis_dbg.phase2_memory_pool(pool_vecs, selected_mask=_selm)
 
             if target_has_memory:
-                tsrc, tfid = best_target
+                tsrc, tfid = best_target            # 매칭/시각화 기준 프레임 (단일 유지)
 
-                x_cat2, sample2, _, avg_vec2, bind_xfeat2 = map(
+                # 매칭용 타겟 프레임 데이터 (XFeat 쪽)
+                kp2, desc2 = xfeat_mgr.get(tsrc, tfid)
+                kp2, desc2 = kp2.cuda(), desc2.cuda()
+                _, _, _, _, bind_xfeat2 = map(
                     lambda x: x.cuda(), dino_mgr.get(tsrc, tfid))
-                feat2, _, _ = objpatcher._prepare_features(x_cat2)
-                kp2, desc2  = xfeat_mgr.get(tsrc, tfid)
-                kp2, desc2  = kp2.cuda(), desc2.cuda()
 
-                # 메모리 앵커를 현재 프레임에 투영 + 품질 필터
-                valid_mask, pure_area_cur, vom_cur, pure_cur = \
-                    objpatcher.project_memory_to_frame(              # unified API
-                        avg_vec2, feat1,
-                        min_pure_response=MIN_CROSS_ANCHORS,
-                        min_pure_vom_ratio=0.10,
-                        max_spatial_std=8.0,
-                        grid_shape=grid_shape,
-                    )
+                # 메모리 풀 앵커를 현재 프레임에 투영 — 단일/크로스 공용 컨텍스트.
+                #   2D 쿼리(메모리 벡터) → self-mask 없음. vom/pure/heatmap_sim 모두 산출.
+                ctx_mem  = objpatcher.compute_anchor_patch_context(avg_vec_mem, feat1)
+                vom_cur  = ctx_mem["vom"]       # [M, N]
+                pure_cur = ctx_mem["pure"]      # [M, N]
+                # heatmap_sim = ctx_mem["heatmap_sim"]  # [M, M] 등록 판단/merge 에 활용 가능
+
+                valid_mask = objpatcher.filter_anchors(              # = filter_by_quality
+                    vom_cur, pure_cur,
+                    min_pure_response=MIN_CROSS_ANCHORS,
+                    min_pure_vom_ratio=0.10,
+                    max_spatial_std=8.0,
+                    grid_shape=grid_shape,
+                )
 
                 K_cross = valid_mask.sum().item()
-                print(f"[크로스프레임] 메모리 앵커 {avg_vec2.shape[0]} → 유효 {K_cross}")
+                print(f"[크로스프레임] 풀 앵커 {avg_vec_mem.shape[0]} → 유효 {K_cross}")
 
                 if vis_dbg is not None:
                     vis_dbg.phase3_cross_frame(img1, vom_cur, pure_cur,
                                                valid_mask, grid_shape)
+                    vis_dbg.phase3_cross_context(img1, ctx_mem, grid_shape,
+                                                 valid_mask=valid_mask)
 
                 if K_cross >= MIN_CROSS_ANCHORS:
                     # 유효 앵커만 사용
@@ -233,10 +278,13 @@ def inference_loop(zmq_socket):
                     avg_vec_cur, _ = objpatcher.recompute_anchor_vecs(   # unified API
                         x_cat1, pure_f.float(), attn_1)
 
-                    work_sample  = sample2[valid_mask]   # 메모리 시드 (위치 참조용)
+                    # 풀에는 단일 시드가 없으므로 현재 프레임 투영 응답 피크를
+                    # 대표 패치(위치 참조용)로 사용
+                    work_sample  = pure_f.float().argmax(dim=1).long()   # [K']
                     work_vom     = vom_f
                     work_pure    = pure_f
                     work_avg_vec = avg_vec_cur
+                    work_mem_vec = avg_vec_mem[valid_mask]   # smat용 메모리 벡터
                     used_cross   = True
 
             # ── 4-B. 단일 프레임 폴백 ────────────────────────────────────
@@ -273,8 +321,10 @@ def inference_loop(zmq_socket):
                     grid_shape=grid_shape,
                 )
                 if vis_dbg is not None:
+                    _qm = {"pure_area": work_pure.sum(dim=1).long().tolist()}
                     vis_dbg.phase4_quality_filter(img1, work_vom, work_pure,
-                                                  keep, grid_shape)
+                                                  keep, grid_shape,
+                                                  quality_metrics=_qm)
                 if keep.any() and not keep.all():
                     work_sample  = work_sample[keep]
                     work_vom     = work_vom[keep]
@@ -287,12 +337,26 @@ def inference_loop(zmq_socket):
             else:
                 K_final = 0
 
+            # ── 5-b. 앵커 객체 표현 계산 (표현/가중/중복 토글) ────────────
+            #   work_avg_vec : 항상 avg 표현(메모리 저장 slot3 → 풀 재구성용)
+            #   work_repr    : downstream(매칭·뱅크·multiresponse)에서 쓰는 표현
+            if K_final > 0:
+                work_avg_vec = objpatcher.compute_object_vectors(
+                    feat1, work_sample, work_vom, attn=attn_1,
+                    repr="avg", weight=AVG_WEIGHT, overlap=OVERLAP_MODE)
+                if ANCHOR_REPR == "patch":
+                    work_repr = F.normalize(feat1[work_sample], p=2, dim=1)
+                else:
+                    work_repr = work_avg_vec
+            else:
+                work_repr = work_avg_vec
+
             t_anchor = time.time()
 
             # ── 6. Multi-Response Masking ────────────────────────────────
             N = feat1.shape[0]
             if K_final > 0:
-                sim_for_mask = torch.mm(work_avg_vec, feat1.t())
+                sim_for_mask = torch.mm(work_repr, feat1.t())
                 I_n, overlap_counts = objpatcher.detect_multiresponse(  # unified API
                     sim_for_mask, th_sim=0.60, th_margin=0.12)
                 clean_patch_mask = (I_n < 1)
@@ -307,7 +371,7 @@ def inference_loop(zmq_socket):
             if K_final > 0:
                 pure_areas_f = work_pure.sum(dim=1).float()
                 gids = obj_bank.register_or_update(
-                    avg_vecs=work_avg_vec,
+                    avg_vecs=work_repr,
                     pure_areas=pure_areas_f,
                     frame_id=fid.decode(),
                     vom=work_vom,
@@ -335,11 +399,15 @@ def inference_loop(zmq_socket):
                 mat_sample_xfeat1 = torch.zeros(
                     (0, bind_xfeat_mat1.shape[1]), device=feat1.device)
 
+            # Phase 4 디버그 — 앵커별 귀속 XFeat 키포인트
+            if vis_dbg is not None and K_final > 0:
+                vis_dbg.phase4_anchor_xfeat(img1, mat_sample_xfeat1, kp1, grid_shape)
+
             dino_mgr.process(src, fid, (
                 x_cat1.cpu(),
                 work_sample.cpu()  if K_final > 0 else torch.zeros(0, dtype=torch.long),
                 work_vom.cpu()     if K_final > 0 else torch.zeros((0, N), dtype=torch.bool),
-                work_avg_vec.cpu() if K_final > 0 else torch.zeros((0, 384)),
+                work_avg_vec.cpu() if K_final > 0 else torch.zeros((0, 384)),  # slot3=avg(풀 재구성용)
                 bind_xfeat_mat1.cpu(),
             ))
 
@@ -348,7 +416,7 @@ def inference_loop(zmq_socket):
                 vom_match = work_vom & clean_patch_mask.unsqueeze(0)
                 mat_xfeat2_f = torch.matmul(vom_match.float(), bind_xfeat2)
 
-                smat = matcher.build_affinity_matrix(work_avg_vec, avg_vec2[valid_mask])
+                smat = matcher.build_affinity_matrix(work_repr, work_mem_vec)
                 fmat = matcher.build_affinity_matrix(desc1, desc2)
                 match_mask, match12 = \
                     matcher.compute_local_point_correspondence_batch_fixed(
